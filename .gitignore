@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Personal biosignal data - keep local
+profiles/
+recordings/
+
+# Third-party installers (download BlueMuse from its GitHub releases instead)
+BlueMuseInstaller/
+*.zip
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+push_to_github.bat

@@ -1,0 +1,6 @@
+numpy>=1.24
+scipy>=1.10
+pylsl>=1.16        # reads the BlueMuse / muselsl LSL stream
+# optional:
+# pyserial         # --output serial:COM5:115200 (Arduino / ESP32)
+# brainflow        # --source brainflow (direct Bluetooth, no BlueMuse)
