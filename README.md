@@ -1,15 +1,15 @@
 # Muse 2 → Yahboom RosmasterPi A1
 
-Drive a **Yahboom RosmasterPi A1** robot car with a **Muse 2** EEG headband. Four deliberate
-face/eye gestures are detected in real time from the headband's 4 channels and sent over Wi-Fi
-to the robot, which drives through ROS 2.
+Drive a **Yahboom RosmasterPi A1** robot car with a **Muse 2** EEG headband. Three deliberate
+face gestures are detected in real time from the headband's 4 channels and sent over Wi-Fi
+to the robot, which drives through ROS 2. (Steering by gaze is a separate, camera-based part
+of the project.)
 
-| Gesture | Detected from | Command | Robot (Ackermann car) |
+| Gesture | Detected from | Command | Robot |
 |---|---|---|---|
-| **Jaw clench** | muscle activity (EMG, 30–110 Hz) on all 4 sensors | `STOP` | stops at once (always wins) |
+| **Jaw clench** | muscle burst (EMG, 30–110 Hz), forehead sensors stay still | `STOP` | stops (always wins) |
 | **Double blink** | two blink peaks ~0.2–0.5 s apart | `GO` | drives forward |
-| **Look left** (and back) | eye-movement spike, then the opposite spike | `LEFT` | steers left for 1.5 s |
-| **Look right** (and back) | same, other direction | `RIGHT` | steers right for 1.5 s |
+| **Eyebrow raise** | muscle burst + large slow shift of the forehead sensors | `BROW` | not used by the bridge yet - map it in `config.py` |
 
 ```
 Muse 2 ──BLE──> BlueMuse ──LSL──> muse_robot (Windows laptop) ──Wi-Fi/UDP──> eeg_cmd_bridge.py ──/cmd_vel──> RosmasterPi A1
@@ -52,8 +52,8 @@ calibrated signal-processing pipeline that runs comfortably in real time on any 
    packages; after that it opens this menu:
 
    ```
-   1. Check signal   (NaN, contact quality, 20 s)
-   2. Calibrate      (about 3 minutes)
+   1. Check signal   (NaN, contact quality, 10 s)
+   2. Calibrate      (about 2 minutes)
    3. Run            - show commands on screen only
    4. Run            - send to a SERIAL device (COM port)
    5. Run            - drive the YAHBOOM ROBOT over Wi-Fi
@@ -64,16 +64,18 @@ calibrated signal-processing pipeline that runs comfortably in real time on any 
 
 3. **1 - Check signal**: every channel should say `OK`. If not, push the headband down so the
    forehead pads sit flat, move hair away from the ear sensors and check again.
-4. **2 - Calibrate** (~3 min, prompts on screen, cue sounds for the look trials).
+4. **2 - Calibrate** (~2 min, prompts on screen). Recalibrate every time you put the
+   headset on - the blink signal depends on how it sits.
 5. **3 - Run** to see the commands on screen, then **5 - Run** to drive the robot
    (after the [robot setup](#robot-setup)). While running, `Ctrl+C` then `N` returns to the menu.
 
 ### Doing the gestures
 
-- **Jaw clench** - bite down firmly for about a second. Most reliable, so it is `STOP`.
-- **Double blink** - two quick, firm blinks.
-- **Look left / right** - move **only your eyes** far to the side, hold at least 0.5 s, come back
-  to the screen. Keep your head still. The next look is accepted about 1 s later.
+- **Jaw clench** - bite down firmly for about a second. Very reliable, so it is `STOP`.
+- **Double blink** - two quick, *firm* blinks (~0.3 s apart). Natural blinks that happen to
+  come in a quick pair look the same, so this is the gesture that can trigger by accident.
+- **Eyebrow raise** - raise both eyebrows high for about a second, **teeth apart**. An unclear
+  burst always counts as `STOP`.
 
 ## Robot setup
 
@@ -85,13 +87,14 @@ Full guide: **[robot/README_robot.md](robot/README_robot.md)**. In short:
 3. On the robot: start the chassis driver as in Yahboom's A1 tutorial (`yahboomcar_bringup`,
    the same one used for keyboard/joystick control), check `ros2 topic info /cmd_vel`, then
    `bash ~/eeg_bridge/start_bridge.sh`.
-4. On the laptop: **8 - Test robot connection** (drive with `g`/`a`/`d`/`s`, wheels off the ground
-   the first time), then **5 - Run**.
+4. On the laptop: **8 - Test robot connection** (`g` = GO, `s` = STOP, `a`/`d` = steer;
+   wheels off the ground the first time), then **5 - Run**.
 
 **Safety:** the laptop sends a heartbeat twice a second; if the robot hears nothing for 1.5 s
 (program closed, laptop asleep, Wi-Fi lost) it stops by itself and waits for a new `GO`.
 Closing the laptop program sends `STOP`. `STOP` is never blocked by any filter.
-Speed (default 0.15 m/s), steering, turn time and timeouts are options of `start_bridge.sh`.
+Speed (default 0.15 m/s) and timeouts are options of `start_bridge.sh`
+(`--max-drive 20` stops automatically after 20 s without a new command).
 
 ## How it works
 
@@ -102,10 +105,13 @@ Measured on real recordings with this project:
 - Muse 2's reference electrode (Fpz) sits on the forehead **right above the eyes**. A blink is
   therefore seen mostly as a large *negative* dip (≈ −250 µV) on the **ear** sensors TP9/TP10,
   and only as a small wiggle on the forehead sensors AF7/AF8.
-- An eye movement to the side gives a short **spike** (~0.3 s) - AF7 and AF8 in opposite
-  directions - that fades even while the eyes stay to the side. Looking back gives the
-  opposite spike.
-- Clenching the jaw produces broadband muscle activity (EMG) far above the EEG band.
+- Clenching the jaw produces broadband muscle activity (EMG) far above the EEG band - the
+  most robust signal the headband gives. It reaches all four sensors, strongest at the ear
+  sensors TP9/TP10.
+- Raising the eyebrows also produces a muscle burst on all four sensors - on the real
+  recording its forehead/ear EMG ratio overlapped with the jaw clench, so EMG alone can't tell
+  them apart. But it **moves the forehead skin under AF7/AF8**: within 0.3 s the forehead
+  signal shifts by 630–955 µV, versus 10–40 µV for a jaw clench (8 trials each, same session).
 
 ### Pipeline (`muse_robot/`)
 
@@ -113,70 +119,71 @@ Measured on real recordings with this project:
    filters would otherwise turn one NaN into NaN forever); 50/100 Hz mains notch.
 2. **Features** - all filters are causal and keep state between chunks, so offline replay of a
    recording gives exactly the same events as live:
-   - **EMG envelope**: 30–110 Hz band, RMS over 100 ms, averaged over the 4 channels.
-   - **Blink signal B** and **gaze signal H**: the 0.5–10 Hz signal projected on two
-     4-channel patterns learned in calibration (a blink, and a *left* look), each made
-     orthogonal to the other so a blink barely moves H and a look barely moves B.
+   - **EMG envelope**: 30–110 Hz band, RMS over 100 ms, averaged over the 4 channels (the
+     ear and forehead pairs are also logged separately).
+   - **Forehead slow signal**: AF7/AF8 at 0.5–10 Hz, for the eyebrow decision.
+   - **Blink signal B**: the 0.5–10 Hz signal projected on the 4-channel blink pattern learned
+     in calibration, with the sideways-eye direction (AF7 − AF8) removed so glancing left or
+     right does not look like a blink.
 3. **Detectors** (`detectors.py`):
-   - `JAW_CLENCH`: envelope above threshold for ≥ 120 ms.
-   - `DOUBLE_BLINK`: two B peaks (40–600 ms wide) between 0.12 s and the learned max gap apart;
-     a single blink just expires.
-   - `LOOK_LEFT/RIGHT`: an H spike, then an opposite spike 0.45 s to ~2.4 s later; the sign of
-     the first spike is the direction. A double blink leaks into H as spikes only ~0.3 s apart,
-     so it cannot form a look; filter rebounds right after a spike and leftovers for 1 s after
-     a look are ignored.
-4. **Safety rules** - blink/look candidates overlapping a jaw clench or a head movement
-   (gyroscope) are discarded; after a data gap ≥ 100 ms, blink/look events are muted for 0.6 s.
-   `STOP` always passes.
+   - Muscle burst: envelope above threshold for ≥ 120 ms. Then, 0.3 s after the burst
+     started, if the forehead signal has moved more than the learned threshold (in the learned
+     direction) → `EYEBROW_RAISE`, otherwise → `JAW_CLENCH`. An unclear burst is therefore
+     always `STOP`. Before a profile has eyebrow calibration, every burst is `STOP` and is
+     reported immediately; with eyebrow detection on, `STOP` comes 0.3 s after the clench
+     starts (≈ 4.5 cm at 0.15 m/s).
+   - `DOUBLE_BLINK`: two B peaks (40–600 ms wide) between 0.12 s and the learned max gap
+     apart; a single blink just expires.
+4. **Safety rules** - blink candidates overlapping a muscle burst or a head movement
+   (gyroscope) are discarded; after a data gap ≥ 100 ms, blink events are muted for 0.6 s.
+   Muscle events (`STOP`) always pass.
 
-Why not a neural network for these four commands: calibration gives ~32 labelled trials per
-user, the signals are tens to hundreds of µV (far larger than EEG), and a rule-based detector
-can explain every decision and runs with ~0.1–0.3 s latency. Every calibration is saved, so the
-same data can train and benchmark an ML model later.
+Why not a neural network: calibration gives ~24 labelled trials per user, the signals are
+tens to hundreds of µV (far larger than EEG), and a rule-based detector can explain every
+decision and runs with ~0.1–0.3 s latency. Every calibration is saved, so the same data can
+train and benchmark an ML model later.
 
 ## Calibration
 
 ```
-15 s rest -> JAW x8 -> DOUBLE BLINK x8 -> LOOK LEFT x8 -> LOOK RIGHT x8        (~2.6 min)
-screen: "[Block 4/5] LOOK LEFT"  "LOOK LEFT 3/8 >>> NOW <<<"
+15 s rest -> JAW CLENCH x8 -> DOUBLE BLINK x8 -> EYEBROW RAISE x8          (~1.9 min)
+screen: "[Block 2/4] JAW CLENCH"  "JAW CLENCH 3/8 >>> NOW <<<"  ...  "relax jaw"
 ```
 
-| Trial | Cue |
-|---|---|
-| Jaw clench | screen only: `>>> NOW <<<` → clench, `relax jaw` 1 s later → release |
-| Double blink | screen only: `>>> NOW <<<` → blink twice |
-| Look left / right | `signal.wav` from the speakers → eyes to the block's side and hold; **1 s after the sound ends**, a low beep → eyes back to the screen |
-
-The look trials need a sound because the eyes are off the screen; the fixed return beep gives
-every trial the same hold time, so the data are consistent.
-
-What calibration learns per user: the blink and look patterns, all thresholds, the double-blink
-timing and the look out-and-back timing. Natural blinks and small movements are expected:
-trials spoiled by electrode shifts, Bluetooth gaps or head movement are rejected and reported;
-gestures that still come out weak (< 75 % replay accuracy) can be re-recorded on their own.
-The report shows per-gesture accuracy, a confusion matrix and false triggers per minute at rest.
+What calibration learns per user: the blink pattern, the muscle-burst and blink thresholds,
+the forehead-shift threshold and direction for jaw vs eyebrow, and the double-blink timing. If eyebrow raises and jaw clenches look
+the same on someone's headset, eyebrow raise is switched off (every burst = `STOP`) and the
+report says so. Natural blinks and small movements are expected: the rest data with natural blinks
+teaches the threshold to ignore single blinks; trials spoiled by electrode shifts, Bluetooth
+gaps or head movement are rejected and reported; a gesture that still comes out weak
+(< 75 % replay accuracy) can be re-recorded on its own. The report shows per-gesture
+accuracy, a confusion matrix and false triggers per minute at rest.
 
 ## Results
 
-**Real data** (one user, two separate sessions on the same day; calibrate on session 2, test on
-session 1 - a different session than the one used for fitting):
+Real data: one user, three sessions on two days and two laptops. Each session was used once
+for calibration and tested on itself and on the two others.
 
-| Gesture | Accuracy |
-|---|---|
-| Jaw clench | 100 % |
-| Double blink | 100 % |
-| Look left | 75 % (the miss was a smaller-than-usual eye movement) |
-| Look right | 100 % |
-| **Overall** | **94.7 %** |
+| | Jaw clench | Double blink |
+|---|---|---|
+| Same session (calibrated that session) | **100 %** (3/3 sessions) | 60–100 % (mean 87 %) |
+| Other session (no recalibration) | **100 %** (6/6 pairs) | 0–100 % (mean 70 %) |
+| False triggers at rest | none | 0–24 per minute, from natural blinks in quick pairs |
 
-False triggers come mainly from **natural blinks in quick pairs**, which look exactly like a
-double blink (≈ 1 per 15 s of rest in one session). This is the gesture to watch; the
-calibration report warns when it happens.
+**Eyebrow raise** (one session, 8 jaw clenches + 8 eyebrow raises): the first version told
+them apart by the forehead/ear EMG ratio and confused some jaw clenches with eyebrow raises
+(gap between the groups 0.03 in log ratio). Using the forehead shift instead: threshold
+334 µV with jaw at 10–40 µV and eyebrow at 630–955 µV; replay 16/16 and leave-one-out 16/16
+correct. More sessions are needed for a cross-session number.
 
-**Simulator** (`python -m muse_robot sim-test`, signal model based on the real recordings, with
-natural blinks, NaN dropouts and frequent head movements): 84–98 % of 80 gestures over three
-seeds, 0–1 false commands in 6.8 min. The simulator is a regression test, not a substitute for
-real data.
+Jaw clench is reliable across sessions. Double blink depends on headset fit and on how
+someone blinks naturally - recalibrate each session, and if `GO` fires by accident, use
+firmer, more deliberate double blinks.
+
+**Simulator** (`python -m muse_robot sim-test`, signal model based on the real recordings,
+with natural blinks, NaN dropouts and frequent head movements): 95–100 % of 80 gestures over
+three seeds, every jaw clench and eyebrow raise correct, 0–2 false commands in 6.8 min. The simulator is a regression test, not a
+substitute for real data.
 
 ## Command line
 
@@ -194,6 +201,8 @@ python -m pytest tests                                       # tests
 `--source brainflow` connects to the Muse directly over Bluetooth instead of BlueMuse.
 `--output` can be given several times (`print`, `robot:IP[:PORT]`, `udp:HOST:PORT`,
 `serial:PORT[:BAUD]`). Gesture → command mapping: `DEFAULT_COMMAND_MAP` in `muse_robot/config.py`.
+Recordings made with older versions (which also had look-left/right trials) can still be
+re-fitted with `fit`.
 
 ## Project structure
 
@@ -202,18 +211,17 @@ MuseRobot.bat              Windows menu (sets up Python on first run)
 muse_robot/
   config.py                constants, command map, per-user Profile (JSON)
   sources.py               BlueMuse/muselsl (LSL) + gyroscope, BrainFlow, simulator
-  dsp.py                   NaN handling, filters, EMG / blink / gaze signals
-  detectors.py             jaw, double-blink and look detectors, CommandEngine
+  dsp.py                   NaN handling, filters, EMG envelopes (all / ear / forehead), blink signal
+  detectors.py             muscle-burst (jaw vs eyebrow) and double-blink detectors, CommandEngine
   calibrate.py             cue protocol, trial rejection, fitting, replay evaluation
   outputs.py               screen, UDP to the robot (heartbeat + acks), serial
-  sounds.py                calibration cue sounds (uses signal.wav if present)
+  sounds.py                optional beep when a command is detected
   cli.py                   command line
 robot/
   eeg_cmd_bridge.py        runs ON THE ROBOT: UDP commands -> ROS 2 /cmd_vel, watchdog
   start_bridge.sh          starts the bridge on the robot
   README_robot.md          robot setup guide
 tests/test_pipeline.py     pytest suite (filters, NaN, motion gating, STOP, bridge, simulator)
-signal.wav                 go cue for the look trials
 lsl_api.cfg                keeps the LSL library quiet
 ```
 
@@ -227,10 +235,11 @@ created locally and are **not** committed: they are personal biosignal data.
 | `No EEG stream found` | BlueMuse must be streaming (Start Streaming) |
 | A channel is not `OK` in Check signal | reseat the headband; forehead pads flat, hair away from ear sensors |
 | NaN values | short gaps are filled automatically; many gaps → move the laptop closer, avoid USB 3 ports next to the Bluetooth adapter |
-| Blinks / looks missed | recalibrate; make looks bigger and hold ≥ 0.5 s; firm double blinks |
+| Double blinks missed | recalibrate; blink twice firmly, ~0.3 s apart |
+| Eyebrow raise detected as STOP | raise higher with the teeth apart; forehead pads flat; redo the eyebrow block |
+| Jaw clench detected as eyebrow | recalibrate; keep the eyebrows still while clenching |
 | Random `GO` | natural quick double blinks; blink relaxed, use a firmer deliberate double blink |
 | Robot `NO REPLY` | robot IP, same Wi-Fi, bridge running, allow Python in Windows Firewall (private networks) |
-| Robot turns the wrong way | `bash start_bridge.sh --steer -0.6` |
 
 ## Next steps
 

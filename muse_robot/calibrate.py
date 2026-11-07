@@ -1,29 +1,20 @@
-"""Calibration: cue the user (screen + sound), record, fit per-user thresholds, evaluate.
+"""Calibration: cue the user on screen, record, fit per-user thresholds, evaluate.
 
-Protocol (default 8 trials, about 2.6 min):
+Protocol (default 8 trials, about 1.9 min):
   15 s rest (eyes open, blink normally)
-  4 blocks (jaw, double blink, look left, look right) of N trials
-  jaw / blink trial = 2.0 s cue window + 1.5 s pause
-  look trial        = go sound + 1 s silence + "eyes back" beep + 1.2 s, then 1.5 s pause
-
-Cues
-  jaw / double blink: screen only (">>> NOW <<<", "relax jaw"), no sound
-  look left / right:  go sound (signal.wav if present, else a beep) from the speakers,
-                      then, 1 s AFTER the go sound has finished, a low "eyes back" beep.
-                      The direction comes from the block (all-left, then all-right).
-  The eyes are off-screen during look trials, so the return cue has to be audible;
-  the 1 s gap keeps the two sounds clearly separate.
+  3 blocks (jaw clench, double blink, eyebrow raise) of N trials,
+  each trial = 2.0 s cue window + 1.5 s pause; cues are on screen only
 
 Robustness
-  * Natural blinks are expected everywhere: calibration learns the 4-channel pattern
-    of a blink and of a look and makes each signal blind to the other; natural
-    blinks in the rest/look data count as "not a double blink".
+  * Natural blinks are expected everywhere: rest data with natural blinks teaches
+    the double-blink threshold to ignore single blinks and blinks far apart.
   * Trials spoiled by head movement / big electrode shifts / Bluetooth gaps are
     detected and left out of the threshold fitting (reported as "rejected").
   * Gestures that still come out weak can be re-recorded on their own (redo).
 
 The raw recording + cue markers are saved as .npz so you can re-fit later or use
-them to train an ML model.
+them to train an ML model. Older recordings that also contain LOOK_LEFT/LOOK_RIGHT
+trials still work: those trials are used as "not this gesture" examples.
 """
 from __future__ import annotations
 
@@ -43,22 +34,16 @@ from .sounds import Sound
 LEAD_S = 3.0          # filters settle; no cues
 REST_S = 15.0
 BLOCK_PAUSE_S = 3.0   # read the instruction
-CUE_S = 2.0           # window in which jaw / blink is expected
+CUE_S = 2.0           # window in which the gesture is expected
 GAP_S = 1.5           # pause between trials
 FIT_SLACK_S = 0.5     # extra time after the cue window used for fitting (late reactions)
-JAW_RELAX_AT = 1.0    # "relax jaw" text after the cue (s)
-LOOK_SILENCE_S = 1.0  # silence between the end of the go sound and the "eyes back" beep
-LOOK_AFTER_S = 1.2    # time after the "eyes back" beep to finish the return movement
-GO_SOUND = {"LOOK_LEFT": "go", "LOOK_RIGHT": "go"}
+RELAX_AT = 1.0        # "relax" text after the cue for jaw / eyebrow (s)
 
 INSTRUCTIONS = {
     "REST": "Sit still, eyes on the screen, blink normally.",
     "JAW_CLENCH": "On '>>> NOW': clench your teeth.  On 'relax jaw': release.",
     "DOUBLE_BLINK": "On '>>> NOW': blink twice, quickly and firmly.",
-    "LOOK_LEFT": "Keep your head still. Sound: eyes far LEFT (big movement) and hold. "
-                 "Low beep: eyes back to the screen.",
-    "LOOK_RIGHT": "Keep your head still. Sound: eyes far RIGHT (big movement) and hold. "
-                  "Low beep: eyes back to the screen.",
+    "EYEBROW_RAISE": "On '>>> NOW': raise your eyebrows high (teeth apart).  On 'relax': release.",
 }
 
 
@@ -70,17 +55,8 @@ class Marker:
 
 
 # --------------------------------------------------------------------------- protocol
-def look_back_at(sound=None) -> float:
-    """Seconds from the look go-cue to the 'eyes back' beep: go sound length + 1 s silence."""
-    go = sound.duration("go") if sound is not None else 0.2
-    return round(go + LOOK_SILENCE_S, 3)
-
-
-def build_schedule(gestures=GESTURES, n_trials=8, rest_s=REST_S, back_at=1.2):
-    """Returns (ui_messages [dict], markers, total_seconds). back_at: see look_back_at()."""
-    def cue_len(g):
-        return back_at + LOOK_AFTER_S if g.startswith("LOOK") else CUE_S
-
+def build_schedule(gestures=GESTURES, n_trials=8, rest_s=REST_S):
+    """Returns (ui_messages [dict], markers, total_seconds)."""
     msgs, markers = [], []
     blocks = (["REST"] if rest_s > 0 else []) + list(gestures)
     t = LEAD_S
@@ -91,16 +67,14 @@ def build_schedule(gestures=GESTURES, n_trials=8, rest_s=REST_S, back_at=1.2):
             t += rest_s
             continue
         msgs.append(dict(t=t, kind="block", label=g, block=b, nblocks=len(blocks),
-                         secs=BLOCK_PAUSE_S + n_trials * (cue_len(g) + GAP_S)))
+                         secs=BLOCK_PAUSE_S + n_trials * (CUE_S + GAP_S)))
         t += BLOCK_PAUSE_S
         for i in range(1, n_trials + 1):
-            msgs.append(dict(t=t, kind="cue_on", label=g, trial=i, n=n_trials, hold=back_at))
-            if g.startswith("LOOK"):
-                msgs.append(dict(t=t + back_at, kind="cue_back", label=g, trial=i, n=n_trials))
-            elif g == "JAW_CLENCH":
-                msgs.append(dict(t=t + JAW_RELAX_AT, kind="cue_back", label=g, trial=i, n=n_trials))
-            markers.append(Marker(g, int(t * FS), int(cue_len(g) * FS)))
-            t += cue_len(g)
+            msgs.append(dict(t=t, kind="cue_on", label=g, trial=i, n=n_trials))
+            if g in ("JAW_CLENCH", "EYEBROW_RAISE"):
+                msgs.append(dict(t=t + RELAX_AT, kind="cue_back", label=g, trial=i, n=n_trials))
+            markers.append(Marker(g, int(t * FS), int(CUE_S * FS)))
+            t += CUE_S
             msgs.append(dict(t=t, kind="cue_off", label=g, trial=i, n=n_trials))
             t += GAP_S
     msgs.append(dict(t=t, kind="done", label=""))
@@ -119,8 +93,8 @@ class TerminalCueUI:
         elif k == "cue_on":
             print(f"    {g:12s} {m['trial']}/{m['n']}   >>> NOW <<<", flush=True)
         elif k == "cue_back":
-            msg = "<<< eyes back to screen" if m["label"].startswith("LOOK") else "relax jaw"
-            print(f"                      {msg}", flush=True)
+            print(f"                      relax {'jaw' if m['label'] == 'JAW_CLENCH' else 'eyebrows'}",
+                  flush=True)
         elif k == "done":
             print("\nRecording finished.")
 
@@ -146,7 +120,7 @@ class QuietUI:
 def record_calibration(source, gestures=GESTURES, n_trials=8, rest_s=REST_S, ui=None, sound=None):
     ui = ui or TerminalCueUI()
     sound = sound or Sound(False)
-    msgs, markers, total = build_schedule(gestures, n_trials, rest_s, look_back_at(sound))
+    msgs, markers, total = build_schedule(gestures, n_trials, rest_s)
     print(f"\nCalibration: {len(gestures)} gestures x {n_trials} trials"
           + (f" + {rest_s:.0f} s rest" if rest_s else "") + f"  -> about {total / 60:.1f} min")
     need = int(total * FS)
@@ -156,13 +130,8 @@ def record_calibration(source, gestures=GESTURES, n_trials=8, rest_s=REST_S, ui=
         while mi < len(msgs) and msgs[mi]["t"] * FS <= n:
             m = msgs[mi]
             ui.show(m)
-            look = m["label"].startswith("LOOK")
             if m["kind"] == "cue_on":
-                if look:                                   # sound only for look trials
-                    sound.play(GO_SOUND[m["label"]])
-                source.cue(m["label"], hold=m["hold"])
-            elif m["kind"] == "cue_back" and look:
-                sound.play("back")
+                source.cue(m["label"])
             mi += 1
         x = source.read()
         if len(x):
@@ -287,14 +256,15 @@ def fit_profile(raw, markers, base: Profile | None = None) -> Profile:
     p = Profile(**{**(base.__dict__ if base else {}), "report": {}})
     wins = _windows(markers)
     raw4 = raw[:, :4]
-    f0 = FeatureExtractor(FS, p.line_freq, p.blink_w, p.gaze_w).process(raw4)
+    f0 = FeatureExtractor(FS, p.line_freq, p.blink_w).process(raw4)
 
-    # --- head-motion threshold (only with a gyroscope stream)
+    # --- head-motion threshold (only with a gyroscope stream): above the stillness at rest
+    #     and above what the user does during the gesture trials
     if raw.shape[1] > 4:
         sp = np.nan_to_num(raw[:, 4])
         rest = np.concatenate([sp[s:e] for lab, s, e in wins if lab == "REST"] or [sp])
-        looks = [sp[s:e].max() for lab, s, e in wins if lab.startswith("LOOK")]
-        p.motion_thr = float(max(3 * np.percentile(rest, 99), 1.5 * np.median(looks) if looks else 0, 5.0))
+        trials = [sp[s:e].max() for lab, s, e in wins if lab in GESTURES]
+        p.motion_thr = float(max(3 * np.percentile(rest, 99), 1.5 * np.median(trials) if trials else 0, 5.0))
 
     rejected = _reject_trials(raw, f0, wins, p.motion_thr, p.blink_w)
     keep = [w for i, w in enumerate(wins) if i not in rejected]
@@ -302,9 +272,8 @@ def fit_profile(raw, markers, base: Profile | None = None) -> Profile:
     others = lambda lab, excl=(): [(s, e) for l, s, e in keep if l != lab and l not in excl]  # noqa: E731
     report = {}
 
-    # --- learn the 4-channel patterns of a blink and of a LEFT look (0.5-10 Hz, causal
-    #     like live). Only accepted trials are used; natural blinks inside look trials are
-    #     projected out before picking the look spike.
+    # --- learn the 4-channel pattern of a blink (0.5-10 Hz, causal like live) from the
+    #     two strongest deflections of each accepted double-blink trial
     eye = f0.eye
     vecs = []
     for s, e in by("DOUBLE_BLINK"):
@@ -316,78 +285,75 @@ def fit_profile(raw, markers, base: Profile | None = None) -> Profile:
         V = np.array(vecs)
         w = np.linalg.svd(V, full_matrices=False)[2][0]
         p.blink_w = (w if np.median(V @ w) >= 0 else -w).round(4).tolist()
-    ub = np.asarray(p.blink_w) / np.linalg.norm(p.blink_w)
-    outs = []
-    for lab, sg in (("LOOK_LEFT", 1.0), ("LOOK_RIGHT", -1.0)):
-        for s, e in by(lab):
-            e_out = s + max(int(((e - s) / FS - LOOK_AFTER_S - FIT_SLACK_S) * FS), FS // 2)  # before back beep
-            seg = eye[s:e_out]
-            seg = seg - np.outer(seg @ ub, ub)                     # ignore blinks
-            q = int(np.argmax(np.linalg.norm(seg, axis=1)))
-            outs.append(sg * eye[s + q])
-    if len(outs) >= 3:
-        O = np.array(outs)
-        w = np.linalg.svd(O, full_matrices=False)[2][0]
-        p.gaze_w = (w if np.median(O @ w) >= 0 else -w).round(4).tolist()
-    p.gaze_left_sign = 1
 
-    f = FeatureExtractor(FS, p.line_freq, p.blink_w, p.gaze_w).process(raw4)
+    f = FeatureExtractor(FS, p.line_freq, p.blink_w).process(raw4)
 
-    # --- jaw: highest envelope level held for jaw_min_dur
-    held = minimum_filter1d(f.emg, size=int(p.jaw_min_dur * FS))
+    # --- muscle burst (jaw or eyebrow): highest envelope level held for jaw_min_dur
+    n_min = int(p.jaw_min_dur * FS)
+    held = minimum_filter1d(f.emg, size=n_min)
     stat = lambda s, e: float(held[s:e].max())                                       # noqa: E731
-    pos = [stat(s, e) for s, e in by("JAW_CLENCH")]
-    neg = [stat(s, e) for s, e in others("JAW_CLENCH")]
+    muscle = ("JAW_CLENCH", "EYEBROW_RAISE")
+    pos = [stat(s, e) for s, e in by("JAW_CLENCH") + by("EYEBROW_RAISE")]
+    neg = [stat(s, e) for s, e in others("JAW_CLENCH", excl=("EYEBROW_RAISE",))]
     p.jaw_thr, sep = fit_threshold(pos, neg)
     report["JAW_CLENCH"] = {"thr": round(p.jaw_thr, 2), "separation": round(sep, 2)}
 
-    # --- blink threshold: the 2nd-highest peak (= weaker blink of the pair).
-    #     Rest/look windows contain natural blinks -> single blinks are negatives.
-    #     First learn your double-blink timing from the two strongest peaks of each trial,
-    #     then score every window by its strongest pair WITH that timing, so two natural
-    #     blinks 1 s apart in a rest window don't count as a double blink.
+    # --- jaw vs eyebrow: how far the forehead signal (AF7/AF8, 0.5-10 Hz) moves between the
+    #     start of the burst and brow_decide_s later - exactly what the live detector measures.
+    #     Raising the eyebrows moves the forehead skin a lot; clenching the jaw barely does.
+    fore_slow = (f.eye[:, CH["AF7"]] + f.eye[:, CH["AF8"]]) / 2
+    dec_n = int(p.brow_decide_s * FS)
+    above = (f.emg > p.jaw_thr).astype(int)
+    run_ok = np.convolve(above, np.ones(n_min, int), "full")[n_min - 1:] == n_min   # n_min above from i
+
+    def shifts(s, e):
+        idx = np.where(run_ok[s:e])[0]
+        if len(idx) == 0:
+            return None
+        a = s + idx[0]
+        base = fore_slow[max(a - 13, 0):a].mean() if a > 0 else fore_slow[a]
+        seg = fore_slow[a:a + dec_n + 1] - base
+        return float(seg.max()), float(-seg.min())                     # (up, down)
+
+    jaw_s = [x for x in (shifts(s, e) for s, e in by("JAW_CLENCH")) if x is not None]
+    brow_s = [x for x in (shifts(s, e) for s, e in by("EYEBROW_RAISE")) if x is not None]
+    p.brow_shift_thr, brow_sep, jaw_x, brow_x = 1e9, float("nan"), [], []
+    if len(jaw_s) >= 3 and len(brow_s) >= 3:
+        p.brow_dir = 1 if np.median([u for u, _ in brow_s]) > np.median([d for _, d in brow_s]) else -1
+        k = 0 if p.brow_dir > 0 else 1
+        jaw_x = [v[k] for v in jaw_s]
+        brow_x = [v[k] for v in brow_s]
+        if np.median(brow_x) > np.median(jaw_x):
+            cands = np.unique(np.concatenate([jaw_x, brow_x]))
+            # most trials right; ties -> the higher boundary (unclear bursts stay JAW = STOP)
+            score = [np.mean(np.array(brow_x) > c) + np.mean(np.array(jaw_x) <= c) for c in cands]
+            c = cands[max(range(len(cands)), key=lambda i: (round(score[i], 6), cands[i]))]
+            higher = [v for v in brow_x if v > c]
+            p.brow_shift_thr = float((c + min(higher)) / 2) if higher else float(c)
+            brow_sep = float(np.percentile(brow_x, 10) / max(np.percentile(jaw_x, 90), 1e-6))
+    report["EYEBROW_RAISE"] = {"thr": round(p.brow_shift_thr, 1), "separation": round(brow_sep, 2),
+                               "direction": p.brow_dir, "decide_s": p.brow_decide_s,
+                               "jaw_shift": [round(v, 1) for v in jaw_x],
+                               "brow_shift": [round(v, 1) for v in brow_x]}
+
+    # --- double blink: first learn the user's double-blink timing from the two strongest
+    #     peaks of each trial, then score every window by its strongest blink PAIR with that
+    #     timing, so two natural blinks 1 s apart in a rest window don't count.
     bh = f.v_up
     gaps = [g for g in (_second_peak(bh[s:e])[1] for s, e in by("DOUBLE_BLINK")) if g is not None]
     if gaps:
         p.blink_max_gap = float(np.clip(np.percentile(gaps, 90) * 1.4, 0.4, 0.8))
     pair = lambda s, e: _pair_score(bh[s:e], p.blink_min_gap, p.blink_max_gap)        # noqa: E731
     pos = [pair(s, e) for s, e in by("DOUBLE_BLINK")]
-    neg = [pair(s, e) for s, e in others("DOUBLE_BLINK", excl=("JAW_CLENCH",))]
+    neg = [pair(s, e) for s, e in others("DOUBLE_BLINK", excl=muscle)]
     p.blink_thr, sep = fit_threshold(pos, neg, fp_weight=1.0)
     # Natural quick blink pairs during rest can be as strong as deliberate ones; never let
-    # them push the threshold above most of your real double blinks.
+    # them push the threshold above most of the user's real double blinks.
     if pos:
         p.blink_thr = float(min(p.blink_thr, 0.8 * np.percentile(pos, 20)))
     report["DOUBLE_BLINK"] = {"thr": round(p.blink_thr, 2), "separation": round(sep, 2),
                               "max_gap": round(p.blink_max_gap, 2),
                               "pattern": [round(v, 2) for v in p.blink_w]}
-
-    # --- gaze: the smaller of the "out" and "back" spikes must exceed threshold
-    stat = lambda s, e: float(min(f.hd[s:e].max(), -f.hd[s:e].min()))               # noqa: E731
-    pos = [stat(s, e) for s, e in by("LOOK_LEFT") + by("LOOK_RIGHT")]
-    neg = [stat(s, e) for s, e in others("LOOK_LEFT", excl=("LOOK_RIGHT", "JAW_CLENCH", "DOUBLE_BLINK"))]
-    p.gaze_thr, sep = fit_threshold(pos, neg)
-    if pos:                                   # keep it below most of your real look spikes
-        p.gaze_thr = float(min(p.gaze_thr, 0.85 * np.percentile(pos, 20)))
-
-    def first_sign(s, e):
-        seg = f.hd[s:e]
-        return np.sign(seg[np.argmax(np.abs(seg) > 0.5 * np.abs(seg).max())])
-
-    gaps = []
-    for s, e in by("LOOK_LEFT") + by("LOOK_RIGHT"):
-        seg = f.hd[s:e]
-        gaps.append(abs(int(np.argmax(seg)) - int(np.argmin(seg))) / FS)
-    if gaps:
-        p.gaze_max_gap = float(np.clip(np.percentile(gaps, 90) * 1.25, 1.6, 3.5))
-
-    left = [first_sign(s, e) for s, e in by("LOOK_LEFT")]
-    right = [first_sign(s, e) for s, e in by("LOOK_RIGHT")]
-    cons = np.mean([v == 1 for v in left] + [v == -1 for v in right] or [0])
-    report["LOOK_LEFT_RIGHT"] = {"thr": round(p.gaze_thr, 2), "separation": round(sep, 2),
-                                 "max_gap": round(p.gaze_max_gap, 2),
-                                 "direction_consistency": round(float(cons), 2),
-                                 "pattern": [round(v, 2) for v in p.gaze_w]}
 
     counts = {}
     for i, (lab, _, _) in enumerate(wins):
@@ -406,13 +372,17 @@ def fit_profile(raw, markers, base: Profile | None = None) -> Profile:
 
 # --------------------------------------------------------------------------- evaluation
 def evaluate(raw, markers, profile: Profile) -> dict:
-    """Replay the recording through the live engine and score the accepted trials."""
+    """Replay the recording through the live engine and score the accepted trials.
+
+    Windows of other labels (e.g. LOOK trials in old recordings) count as
+    "nothing should fire here" together with the rest windows.
+    """
     events, _ = CommandEngine(profile).process(raw)
     rejected = {(lab, s) for lab, s in profile.report.get("rejected_windows", [])}
     labels = list(GESTURES)
     confusion = {g: {h: 0 for h in labels + ["none"]} for g in labels}
     slack = int(1.0 * FS)
-    rest_s, rest_fp = 0.0, 0
+    rest_s, rest_fp, other_fp = 0.0, 0, 0
     for lab, s, e in _windows(markers):
         if (lab, s) in rejected:
             continue
@@ -422,7 +392,10 @@ def evaluate(raw, markers, profile: Profile) -> dict:
             continue
         e = e + slack - int(FIT_SLACK_S * FS)
         hits = [ev for ev in events if s <= ev.t * FS <= e]
-        confusion[lab][hits[0].gesture if hits else "none"] += 1
+        if lab in confusion:
+            confusion[lab][hits[0].gesture if hits else "none"] += 1
+        else:
+            other_fp += len(hits)
     n_trials = sum(sum(v.values()) for v in confusion.values())
     correct = sum(confusion[g][g] for g in labels)
     return {
@@ -430,6 +403,7 @@ def evaluate(raw, markers, profile: Profile) -> dict:
         "per_gesture": {g: round(confusion[g][g] / max(sum(confusion[g].values()), 1), 3) for g in labels},
         "confusion": confusion,
         "false_positives_per_min_at_rest": round(rest_fp / max(rest_s, 1e-6) * 60, 2),
+        "false_events_in_other_trials": other_fp,
     }
 
 
@@ -445,19 +419,24 @@ def weak_gestures(p: Profile, ev: dict, n_trials: int) -> list[str]:
 
 def print_report(p: Profile, ev: dict) -> None:
     print("\n--- Calibration fit ---")
+    names = {"JAW_CLENCH": "muscle burst", "DOUBLE_BLINK": "double blink", "EYEBROW_RAISE": "brow shift (uV)"}
     for g, r in p.report["fit"].items():
-        accs = [ev["per_gesture"][k] for k in GESTURES if k == g or (g == "LOOK_LEFT_RIGHT" and k.startswith("LOOK"))]
-        flag = "" if min(accs) >= 0.75 else "   <-- weak: do this gesture bigger / more clearly"
-        print(f"{g:16s} threshold={r['thr']:8.2f}  separation={r['separation']:5.2f}{flag}")
-    lr = p.report["fit"]["LOOK_LEFT_RIGHT"]
-    if lr["direction_consistency"] < 0.8:
-        print("  warning: left/right direction was inconsistent; keep your head still and move eyes further")
+        flag = "" if ev["per_gesture"].get(g, 1) >= 0.75 else "   <-- weak: do this gesture bigger / more clearly"
+        print(f"{names.get(g, g):16s} threshold={r['thr']:8.2f}  separation={r['separation']:5.2f}{flag}")
     rej = {g: c for g, c in p.report["trials"].items() if c["rejected"]}
     if rej:
         print("rejected (movement / gaps): " + ", ".join(
             f"{g} {c['rejected']} ({', '.join(f'{k}' for k in c['reasons'])})" for g, c in rej.items()))
     if p.report.get("motion_thr") is not None:
         print(f"head-motion threshold: {p.report['motion_thr']} deg/s")
+    br = p.report["fit"].get("EYEBROW_RAISE")
+    if br and br["thr"] < 1e8:
+        print(f"  eyebrow raise ON: each muscle burst is decided {br['decide_s']} s after it starts "
+              "(STOP comes that much later)")
+    if br and br["thr"] >= 1e8:
+        print("  warning: eyebrow raise and jaw clench looked the same on your headset, so eyebrow raise\n"
+              "  is OFF (every muscle burst = STOP). Raise the eyebrows higher with the teeth apart,\n"
+              "  check the forehead pads sit flat, and redo the eyebrow block.")
     print("\n--- Replay evaluation (accepted trials) ---")
     print(f"accuracy {ev['accuracy'] * 100:.1f}%   per gesture: " +
           ", ".join(f"{g}={v * 100:.0f}%" for g, v in ev["per_gesture"].items()))
@@ -467,9 +446,9 @@ def print_report(p: Profile, ev: dict) -> None:
               "  Blink normally (relaxed) during rest; if this keeps happening, use a firmer double blink.")
     print("confusion (row = cued, col = detected first):")
     cols = list(GESTURES) + ["none"]
-    print(" " * 14 + "".join(f"{c[:10]:>11s}" for c in cols))
+    print(" " * 14 + "".join(f"{c[:12]:>13s}" for c in cols))
     for g, row in ev["confusion"].items():
-        print(f"{g:14s}" + "".join(f"{row[c]:>11d}" for c in cols))
+        print(f"{g:14s}" + "".join(f"{row[c]:>13d}" for c in cols))
 
 
 def calibrate(source, profile_path, recording_dir="recordings", n_trials=8, rest_s=REST_S,
@@ -484,7 +463,7 @@ def calibrate(source, profile_path, recording_dir="recordings", n_trials=8, rest
         weak = weak_gestures(p, ev, n_trials)
         if not weak or attempt == max_redo:
             break
-        secs = build_schedule(weak, n_trials, 0, look_back_at(sound))[2]
+        secs = build_schedule(weak, n_trials, 0)[2]
         if not ui.ask(f"\nRedo only {', '.join(w.replace('_', ' ') for w in weak)} (~{secs:.0f} s)? [Y/n] "):
             break
         raw2, m2 = record_calibration(source, weak, n_trials, 0, ui, sound)

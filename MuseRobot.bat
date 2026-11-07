@@ -65,8 +65,8 @@ echo  ==============================================
 echo     Start BlueMuse and press "Start Streaming" first.
 echo     Current profile: %NAME%
 echo.
-echo     1. Check signal   ^(NaN, contact quality, 20 s^)
-echo     2. Calibrate      ^(about 3 minutes^)
+echo     1. Check signal   ^(NaN, contact quality, 10 s^)
+echo     2. Calibrate      ^(about 2 minutes^)
 echo     3. Run            - show commands on screen only
 echo     4. Run            - send to a SERIAL device ^(COM port^)
 echo     5. Run            - drive the YAHBOOM ROBOT over Wi-Fi

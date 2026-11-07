@@ -8,11 +8,13 @@ Ackermann chassis driver (yahboomcar_bringup). No ROS is needed on the laptop.
     laptop  --UDP:9000-->  eeg_cmd_bridge  --/cmd_vel-->  chassis driver  --> motors
             <--ack/state--
 
-Commands (from the EEG gestures):
+Commands:
     GO     (double blink)  drive forward at --speed, wheels straight
     STOP   (jaw clench)    stop immediately (always wins)
-    LEFT   (look left)     steer left for --turn-time seconds, then straight again
-    RIGHT  (look right)    steer right for --turn-time seconds
+    BROW   (eyebrow raise) no action yet (logged) - give it a meaning in on_command()
+    LEFT / RIGHT           steer for --turn-time seconds, then straight again
+                           (not produced by the EEG gestures any more; still accepted,
+                           e.g. from `muse_robot robot-test` or another program)
     An Ackermann car can't turn in place, so LEFT/RIGHT while stopped drives a short
     arc (--turn-time) at --speed and then stops again.
 

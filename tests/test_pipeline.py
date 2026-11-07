@@ -16,8 +16,8 @@ def test_chunking_is_identical():
     raw = np.concatenate([src.read() for _ in range(400)])
     a, fa = CommandEngine(Profile()).process(raw)
     eng = CommandEngine(Profile())
-    fb = [eng.process(raw[i:i + 12])[1].hd for i in range(0, len(raw), 12)]
-    assert np.allclose(fa.hd, np.concatenate(fb))
+    fb = [eng.process(raw[i:i + 12])[1].v for i in range(0, len(raw), 12)]
+    assert np.allclose(fa.v, np.concatenate(fb))
 
 
 def test_nan_does_not_poison_filters():
@@ -25,7 +25,7 @@ def test_nan_does_not_poison_filters():
     raw = np.concatenate([src.read() for _ in range(200)])
     raw[1000:1040, 1] = np.nan
     _, f = CommandEngine(Profile()).process(raw)
-    assert np.isfinite(f.hd).all() and np.isfinite(f.emg).all()
+    assert np.isfinite(f.v).all() and np.isfinite(f.emg).all()
 
 
 def test_sim_end_to_end(tmp_path):
@@ -40,28 +40,63 @@ def test_sim_end_to_end(tmp_path):
 def test_calibration_schedule():
     from muse_robot.calibrate import build_schedule
     msgs, markers, total = build_schedule(n_trials=8)
-    assert total < 170                                           # about 2.5 min
+    assert total < 120                                           # about 1.9 min
     cues = [m for m in msgs if m["kind"] == "cue_on"]
-    assert len(cues) == 32 and cues[0]["trial"] == 1 and cues[7]["n"] == 8
-    backs = [m for m in msgs if m["kind"] == "cue_back"]
-    assert len(backs) == 24                                      # jaw + left + right
+    assert len(cues) == 24 and cues[0]["trial"] == 1 and cues[7]["n"] == 8
+    assert {m.label for m in markers} == {"REST", "JAW_CLENCH", "DOUBLE_BLINK", "EYEBROW_RAISE"}
 
 
-def test_head_motion_blocks_look():
+def test_head_motion_blocks_blink():
+    """A double blink while the head is turning is ignored; the same blink later is not."""
     from muse_robot.sources import SimulatedSource
     src = SimulatedSource(realtime=False, seed=9, natural_blinks=False, motion=False)
-    eng = CommandEngine(Profile(gaze_thr=50, blink_thr=100, motion_thr=20))
+    eng = CommandEngine(Profile(blink_thr=100, motion_thr=20))
     events = []
     for i in range(200):
         x = src.read()
         x = np.column_stack([x, np.full(len(x), 50.0 if 100 <= i < 140 else 1.0)])   # head turning
-        if i == 105:
-            src.inject("LOOK_LEFT")
-        if i == 160:
-            src.inject("LOOK_LEFT")
+        if i in (110, 160):
+            src.inject("DOUBLE_BLINK")
         events += eng.process(x)[0]
-    looks = [e for e in events if e.gesture == "LOOK_LEFT"]
-    assert len(looks) == 1 and looks[0].t > 160 * 16 / 256
+    blinks = [e for e in events if e.gesture == "DOUBLE_BLINK"]
+    assert len(blinks) == 1 and blinks[0].t > 160 * 16 / 256
+
+
+def test_uncalibrated_profile_never_gives_eyebrow():
+    """Without eyebrow calibration every muscle burst must be STOP (jaw), even a forehead one."""
+    from muse_robot.sources import SimulatedSource
+    src = SimulatedSource(realtime=False, seed=6, natural_blinks=False)
+    eng = CommandEngine(Profile(jaw_thr=15))
+    events = []
+    for i in range(120):
+        if i in (10, 70):
+            src.inject("EYEBROW_RAISE" if i == 10 else "JAW_CLENCH")
+        events += eng.process(src.read())[0]
+    assert [e.gesture for e in events] == ["JAW_CLENCH", "JAW_CLENCH"]
+
+
+def test_eyebrow_vs_jaw_after_calibration():
+    from muse_robot.sources import SimulatedSource
+    src = SimulatedSource(realtime=False, seed=6, natural_blinks=False)
+    eng = CommandEngine(Profile(jaw_thr=15, brow_shift_thr=200, brow_dir=-1))
+    events = []
+    for i in range(120):
+        if i in (10, 70):
+            src.inject("EYEBROW_RAISE" if i == 10 else "JAW_CLENCH")
+        events += eng.process(src.read())[0]
+    assert [e.gesture for e in events] == ["EYEBROW_RAISE", "JAW_CLENCH"]
+
+
+def test_old_recording_with_look_trials_still_fits():
+    """Recordings made before look detection was removed still calibrate."""
+    from muse_robot.calibrate import Marker, evaluate, fit_profile
+    from muse_robot.sources import SimulatedSource
+    src = SimulatedSource(realtime=False, seed=2)
+    raw = np.concatenate([src.read() for _ in range(16 * 50)])
+    markers = [Marker("REST", 256, 15 * 256)] + [Marker("LOOK_LEFT", 20 * 256 + k * 512, 512) for k in range(5)]
+    p = fit_profile(raw, markers)
+    ev = evaluate(raw, markers, p)
+    assert "LOOK_LEFT" not in ev["confusion"] and "false_events_in_other_trials" in ev
 
 
 def test_stop_survives_dropout_mute():
@@ -101,7 +136,10 @@ if __name__ == "__main__":
     test_chunking_is_identical()
     test_nan_does_not_poison_filters()
     test_calibration_schedule()
-    test_head_motion_blocks_look()
+    test_head_motion_blocks_blink()
+    test_uncalibrated_profile_never_gives_eyebrow()
+    test_eyebrow_vs_jaw_after_calibration()
+    test_old_recording_with_look_trials_still_fits()
     test_stop_survives_dropout_mute()
     test_robot_bridge_core()
     with tempfile.TemporaryDirectory() as d:

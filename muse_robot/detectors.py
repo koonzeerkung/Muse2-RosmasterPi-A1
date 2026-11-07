@@ -1,14 +1,14 @@
 """Real-time gesture detectors and the command engine that ties them together.
 
-JAW_CLENCH    muscle (30-110 Hz) envelope stays above threshold for >= jaw_min_dur
+JAW_CLENCH /  muscle (30-110 Hz) envelope stays above threshold for >= jaw_min_dur;
+EYEBROW_RAISE the burst is an eyebrow raise if the forehead signal moved more than
+              brow_shift_thr within brow_decide_s, otherwise a jaw clench (= STOP)
 DOUBLE_BLINK  two peaks of the blink signal B above threshold, blink_min_gap..blink_max_gap apart
-LOOK_LEFT/    a spike of the gaze signal H ("out"), then an opposite spike ("back")
-LOOK_RIGHT    gaze_min_gap..gaze_max_gap later; the sign of the first spike is the direction
 
-B and H come from dsp.FeatureExtractor (learned 4-channel blink / look patterns).
-Cross-suppression: jaw clenching and head movement (gyroscope, if streamed) shift
-the electrodes and create slow artifacts, so blink/look candidates that overlap
-them are discarded. JAW_CLENCH (= STOP) is never suppressed or muted.
+B comes from dsp.FeatureExtractor (learned 4-channel blink pattern).
+Cross-suppression: muscle bursts and head movement (gyroscope, if streamed) shift
+the electrodes and create slow artifacts, so blink candidates that overlap them
+are discarded. Muscle events (JAW_CLENCH = STOP) are never suppressed or muted.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .config import FS, Profile
+from .config import CH, FS, Profile
 from .dsp import FeatureExtractor, Features
 
 
@@ -28,17 +28,42 @@ class Event:
     info: dict = field(default_factory=dict)
 
 
-class JawDetector:
-    def __init__(self, thr: float, min_dur: float, refractory: float, fs: float = FS):
+class MuscleDetector:
+    """Muscle bursts: JAW_CLENCH or EYEBROW_RAISE.
+
+    A burst = muscle envelope above `thr` for `min_dur`. Raising the eyebrows moves the
+    forehead skin under AF7/AF8, which shows as a large slow shift of the forehead signal
+    (hundreds of uV within ~0.3 s); clenching the jaw barely moves it. So, when eyebrow
+    detection is calibrated, the detector waits until `decide_s` after the burst started
+    and calls it EYEBROW_RAISE only if the forehead moved more than `brow_shift_thr` in the
+    learned direction `brow_dir`; everything else is JAW_CLENCH (= STOP, the safe side).
+    Without eyebrow calibration every burst is JAW_CLENCH, reported right away.
+    """
+
+    BASE_N = 13         # ~50 ms of forehead signal before the burst = baseline
+
+    def __init__(self, thr: float, min_dur: float, refractory: float,
+                 brow_shift_thr: float | None = None, brow_dir: int = -1, decide_s: float = 0.3,
+                 fs: float = FS):
         self.thr, self.min_n, self.refractory = thr, int(min_dur * fs), refractory
+        self.brow_on = brow_shift_thr is not None and brow_shift_thr < 1e8
+        self.brow_shift_thr, self.brow_dir, self.decide_s = brow_shift_thr, brow_dir, decide_s
         self.soft = 0.6 * thr
         self.count = 0
+        self.ear_sum = self.fore_sum = 0.0
+        self.hist: deque = deque(maxlen=self.BASE_N)
+        self.run_onset = None
+        self.run_base = 0.0
+        self.run_exc = 0.0
+        self.pending = None            # burst waiting for the jaw/eyebrow decision
         self.soft_start = None
         self.fired = False
         self.last_fire = -1e9
         self.intervals: deque = deque(maxlen=20)   # (start, end) of bursts that fired
 
-    def update(self, t: float, env: float) -> list[Event]:
+    def update(self, t: float, env: float, ear: float = 1.0, fore: float = 0.0,
+               fore_slow: float = 0.0) -> list[Event]:
+        """env/ear/fore: muscle envelopes (all, TP9/TP10, AF7/AF8); fore_slow: 0.5-10 Hz forehead."""
         out = []
         if env > self.soft:
             if self.soft_start is None:
@@ -46,15 +71,40 @@ class JawDetector:
         else:
             if self.fired:
                 self.intervals.append((self.soft_start, t))
-            self.soft_start, self.fired, self.count = None, False, 0
-        self.count = self.count + 1 if env > self.thr else 0
+            self.soft_start, self.fired = None, False
+        if env > self.thr:
+            if self.count == 0:                     # a new run above threshold starts here
+                self.run_onset = t
+                self.run_base = float(np.mean(self.hist)) if self.hist else fore_slow
+                self.run_exc = 0.0
+                self.ear_sum = self.fore_sum = 0.0
+            self.count += 1
+            self.ear_sum += ear
+            self.fore_sum += fore
+        else:
+            self.count = 0
+        if self.run_onset is not None:
+            self.run_exc = max(self.run_exc, self.brow_dir * (fore_slow - self.run_base))
+        if self.pending is not None:
+            p = self.pending
+            p["exc"] = max(p["exc"], self.brow_dir * (fore_slow - p["base"]))
+            if t >= p["at"]:
+                self.pending = None
+                g = "EYEBROW_RAISE" if p["exc"] > self.brow_shift_thr else "JAW_CLENCH"
+                out.append(Event(g, t, {"env": p["env"], "ratio": p["ratio"], "shift": round(p["exc"], 1)}))
         if self.count >= self.min_n and not self.fired and t - self.last_fire >= self.refractory:
             self.fired, self.last_fire = True, t
-            out.append(Event("JAW_CLENCH", t, {"env": round(float(env), 1)}))
+            ratio = round(float(np.log(max(self.fore_sum, 1e-6) / max(self.ear_sum, 1e-6))), 2)
+            if not self.brow_on:
+                out.append(Event("JAW_CLENCH", t, {"env": round(float(env), 1), "ratio": ratio}))
+            else:
+                self.pending = {"at": self.run_onset + self.decide_s, "base": self.run_base,
+                                "exc": self.run_exc, "env": round(float(env), 1), "ratio": ratio}
+        self.hist.append(fore_slow)
         return out
 
     def busy_between(self, a: float, b: float, pad: float = 0.3) -> bool:
-        """Was there a (detected) jaw clench overlapping [a - pad, b + pad]?"""
+        """Was there a (detected) muscle burst overlapping [a - pad, b + pad]?"""
         spans = list(self.intervals)
         if self.fired:
             spans.append((self.soft_start, float("inf")))
@@ -62,7 +112,7 @@ class JawDetector:
 
 
 class MotionTracker:
-    """Head-rotation speed above threshold -> 'moving' intervals (same API as JawDetector)."""
+    """Head-rotation speed above threshold -> 'moving' intervals (same API as MuscleDetector)."""
 
     def __init__(self, thr: float):
         self.thr = thr
@@ -129,68 +179,13 @@ class BlinkDetector:
         return []
 
 
-class GazeDetector:
-    QUIET_S = 1.0       # after a look, ignore spikes this long (leftovers of the return movement)
-
-    def __init__(self, p: Profile, blockers):
-        self.thr, self.sign = p.gaze_thr, p.gaze_left_sign
-        self.min_gap, self.max_gap = p.gaze_min_gap, p.gaze_max_gap
-        self.blockers = blockers
-        self.quiet_until = -1e9        # ignore the rebound of the "back" spike after a look
-        self.in_spike = False
-        self.s = 0
-        self.ext = self.ext_t = 0.0
-        self.pending = None            # (sign, time)
-
-    def update(self, t: float, hd: float) -> list[Event]:
-        """hd = gaze signal H (+ = towards left)."""
-        d = self.sign * hd
-        out = []
-        if not self.in_spike:
-            if abs(d) > self.thr:
-                self.in_spike, self.s, self.ext, self.ext_t = True, int(np.sign(d)), abs(d), t
-        else:
-            if self.s * d > self.ext:
-                self.ext, self.ext_t = self.s * d, t
-            if self.s * d < 0.5 * self.thr:
-                self.in_spike = False
-                out += self._on_spike(self.s, self.ext_t, self.ext, t)
-        if self.pending is not None and t - self.pending[1] > self.max_gap:
-            self.pending = None
-        return out
-
-    def _on_spike(self, s: int, ts: float, amp: float, now: float) -> list[Event]:
-        # Blinks often come together with eye movements, so spikes near a blink are NOT
-        # rejected. A double blink leaks into H as spikes ~0.3 s apart, which is shorter
-        # than gaze_min_gap, so it cannot form a look.
-        if ts < self.quiet_until:
-            return []
-        if self.pending is not None and self.pending[0] == -s and ts - self.pending[1] < self.min_gap:
-            return []                         # filter rebound right after a spike, not a real move
-
-        if _blocked(self.blockers, ts - 0.3, now):
-            self.pending = None
-            return []
-        if self.pending is not None and self.pending[0] == -s and \
-                self.min_gap <= ts - self.pending[1] <= self.max_gap:
-            first = self.pending[0]
-            if _blocked(self.blockers, self.pending[1] - 0.3, now):    # head moved during the look
-                self.pending = None
-                return []
-            self.pending = None
-            self.quiet_until = ts + self.QUIET_S
-            return [Event("LOOK_LEFT" if first > 0 else "LOOK_RIGHT", now, {"amp": round(float(amp), 1)})]
-        self.pending = (s, ts)
-        return []
-
-
 class CommandEngine:
     """Raw Muse samples in -> gesture events out. Use one instance per stream.
 
     NaN handling: NaN samples are replaced by the last good value (in dsp). Short
     gaps are harmless; after a gap >= GAP_S the signal jumps when it comes back,
-    which could look like a blink/eye movement, so blink/look events are muted for
-    MUTE_S. JAW_CLENCH (STOP) always gets through.
+    which could look like a blink, so blink events are muted for MUTE_S.
+    Muscle events (JAW_CLENCH = STOP, EYEBROW_RAISE) always get through.
     """
 
     GAP_S = 0.10
@@ -198,11 +193,11 @@ class CommandEngine:
 
     def __init__(self, profile: Profile, fs: float = FS):
         self.p, self.fs = profile, fs
-        self.fx = FeatureExtractor(fs, profile.line_freq, profile.blink_w, profile.gaze_w)
-        self.jaw = JawDetector(profile.jaw_thr, profile.jaw_min_dur, profile.jaw_refractory, fs)
+        self.fx = FeatureExtractor(fs, profile.line_freq, profile.blink_w)
+        self.jaw = MuscleDetector(profile.jaw_thr, profile.jaw_min_dur, profile.jaw_refractory,
+                                  profile.brow_shift_thr, profile.brow_dir, profile.brow_decide_s, fs)
         self.motion = MotionTracker(profile.motion_thr)
         self.blink = BlinkDetector(profile, [self.jaw, self.motion])
-        self.gaze = GazeDetector(profile, [self.jaw, self.motion])
         self.n = 0
         self.mute_until = 0.0          # no events while the signal recovers from a dropout
         self.bad_run = 0
@@ -215,6 +210,7 @@ class CommandEngine:
         f = self.fx.process(x[:, :4])
         f.motion = motion if motion is not None else np.zeros(len(x))
         bh = f.v_up
+        fore_slow = (f.eye[:, CH["AF7"]] + f.eye[:, CH["AF8"]]) / 2
         events: list[Event] = []
         self.nan_samples += int(f.bad.sum())
         gap_n = int(self.GAP_S * self.fs)
@@ -228,9 +224,11 @@ class CommandEngine:
                 self.bad_run = 0
             if motion is not None:
                 self.motion.update(t, motion[i])
-            new = self.jaw.update(t, f.emg[i])
+            new = self.jaw.update(t, f.emg[i], f.emg_ear[i], f.emg_fore[i], fore_slow[i])
             new += self.blink.update(t, bh[i])
-            new += self.gaze.update(t, f.hd[i])
-            events += [e for e in new if t >= self.mute_until or e.gesture == "JAW_CLENCH"]
+            events += [e for e in new if t >= self.mute_until or e.gesture != "DOUBLE_BLINK"]
         self.n += len(f.v)
         return events, f
+
+
+JawDetector = MuscleDetector     # old name

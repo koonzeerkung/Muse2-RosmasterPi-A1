@@ -166,8 +166,8 @@ class SimulatedSource(Source):
     """Synthetic Muse 2 signal with realistic-ish artifacts.
 
     Background EEG + 50 Hz hum + sweat drift + natural blinks (~15/min).
-    `inject(label)` / `cue(label)` add a gesture: JAW_CLENCH, DOUBLE_BLINK,
-    LOOK_LEFT, LOOK_RIGHT.  `realtime=False` produces data as fast as possible.
+    `inject(label)` / `cue(label)` add a gesture: JAW_CLENCH, DOUBLE_BLINK or EYEBROW_RAISE.
+    `realtime=False` produces data as fast as possible.
     `motion=True` adds random head movements (EEG artifacts on all channels)
     and a 5th gyroscope-speed column, like LSLSource with a gyro stream.
     """
@@ -211,7 +211,7 @@ class SimulatedSource(Source):
         bump = amp * np.exp(-0.5 * ((t - 0.2) / 0.05) ** 2)
         return bump[:, None] * np.array([-1.0, 0.05, -0.2, -1.1])
 
-    def _waveform(self, label: str, hold: float | None = None) -> np.ndarray:
+    def _waveform(self, label: str) -> np.ndarray:
         r = self.rng
         if label == "DOUBLE_BLINK":
             gap = r.uniform(0.25, 0.45)
@@ -220,16 +220,20 @@ class SimulatedSource(Source):
             wf[: len(a)] += a
             wf[int(gap * FS):] += b
             return wf
-        if label in ("LOOK_LEFT", "LOOK_RIGHT"):
-            sign = 1.0 if label == "LOOK_LEFT" else -1.0
-            amp = r.normal(80, 12)
-            hold = r.uniform(0.5, 1.2) if hold is None else hold + r.uniform(-0.1, 0.15)
-            # Measured on a real Muse 2: an eye movement gives a short spike (~0.3 s) that
-            # decays even while the eyes stay to the side: AF7 and AF8 opposite.
-            t = np.arange(int((0.05 + hold + 0.6) * FS)) / FS
-            spike = lambda t0: np.where(t >= t0, (t - t0) / 0.06 * np.exp(1 - (t - t0) / 0.06), 0)  # noqa: E731
-            s = spike(0.05) - spike(0.05 + hold)
-            return (sign * amp * 1.2 * s)[:, None] * np.array([0.25, 1.0, -0.85, -0.2])
+        if label == "EYEBROW_RAISE":
+            # forehead muscle under AF7/AF8 (jaw muscles are under TP9/TP10) + slow skin shift
+            dur = r.uniform(0.7, 1.2)
+            m = int(dur * FS)
+            noise = signal.sosfilt(self.emg_sos, r.normal(0, 1, (m + 200, 4)), axis=0)[200:]
+            noise /= noise.std(axis=0)
+            ramp = np.minimum(1, np.minimum(np.arange(m), np.arange(m)[::-1]) / (0.05 * FS))
+            wf = noise * ramp[:, None] * np.array([18.0, 45.0, 45.0, 18.0])
+            # measured on a real Muse 2: the forehead skin moves -> a slow shift of ~-700 uV on
+            # AF7 (less on AF8) building up over ~0.25 s, held while the eyebrows are up
+            t = np.arange(m) / FS
+            shift = -r.uniform(500, 900) * np.clip((t - 0.08) / 0.2, 0, 1) * ramp
+            wf += shift[:, None] * np.array([0.1, 1.0, 0.6, 0.1])
+            return wf
         if label == "JAW_CLENCH":
             dur = r.uniform(0.7, 1.2)
             m = int(dur * FS)
@@ -246,15 +250,14 @@ class SimulatedSource(Source):
         return int((1.5 + self.rng.exponential(2.5)) * FS)
 
     # -- public ---------------------------------------------------------------
-    def inject(self, label: str, delay: float = 0.0, hold: float | None = None) -> None:
+    def inject(self, label: str, delay: float = 0.0) -> None:
         start = self.n + int(delay * FS)
-        self.active.append([start, self._waveform(label, hold)])
+        self.active.append([start, self._waveform(label)])
         self.injected.append((label, start / FS))
 
-    def cue(self, label: str, hold: float | None = None, **kw) -> None:
-        if label in ("JAW_CLENCH", "DOUBLE_BLINK", "LOOK_LEFT", "LOOK_RIGHT"):
-            self.inject(label, delay=self.rng.uniform(*self.reaction),
-                        hold=hold if label.startswith("LOOK") else None)
+    def cue(self, label: str, **kw) -> None:
+        if label in ("JAW_CLENCH", "DOUBLE_BLINK", "EYEBROW_RAISE"):
+            self.inject(label, delay=self.rng.uniform(*self.reaction))
 
     def flush(self) -> None:
         self.t0 = time.monotonic() - self.n / FS        # no backlog after waiting at a prompt

@@ -16,11 +16,12 @@ listens to - the same one Yahboom's keyboard / joystick control uses.
 |---|---|---|
 | Double blink | GO | drive forward (`--speed`, default 0.15 m/s), wheels straight |
 | Jaw clench | STOP | stop immediately - always wins |
-| Look left | LEFT | steer left for `--turn-time` (1.5 s), then straight again |
-| Look right | RIGHT | steer right for `--turn-time` |
+| Eyebrow raise | BROW | nothing yet (logged) - choose a meaning and add it to the bridge |
+| (keyboard test only) | LEFT / RIGHT | steer for `--turn-time` (1.5 s), then straight again |
 
-The A1 has Ackermann (car-like) steering and can't turn on the spot, so LEFT/RIGHT while
-stopped drives a short arc and stops again.
+The EEG side sends GO, STOP and BROW. The bridge still accepts LEFT/RIGHT (the A1 has
+Ackermann steering, so a turn while stopped drives a short arc), which the keyboard test
+uses and another program could send.
 
 **Safety:** if the robot hears nothing from the laptop for 1.5 s (program closed, laptop
 asleep, Wi-Fi lost) it stops and waits for a new GO. Quitting the laptop program sends STOP.
@@ -60,7 +61,7 @@ On the robot (SSH or a terminal on the robot):
 
 On the laptop (`MuseRobot.bat`):
 
-4. **8. Test robot connection** - enter the robot IP, then `g` (GO), `a`/`d` (LEFT/RIGHT),
+4. **8. Test robot connection** - enter the robot IP, then `g` (GO), `a`/`d` (steer LEFT/RIGHT),
    `s` (STOP), `q` (quit). You should see `CONNECTED` and the robot's state after each key.
 5. **5. Run - drive the YAHBOOM ROBOT over Wi-Fi** - BlueMuse streaming, profile calibrated.
    The status line shows the signal and `robot: DRIVE/STOP ...`; `NO REPLY` means the link

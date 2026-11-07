@@ -1,7 +1,7 @@
 """Command line entry point:  python -m muse_robot <command> ...
 
-  check       stream 20 s and report sample rate, NaN, contact quality per channel
-  calibrate   guided recording (~2.6 min) -> per-user profile JSON
+  check       stream 10 s and report sample rate, NaN, contact quality per channel
+  calibrate   guided recording (~1.3 min) -> per-user profile JSON
   run         live detection -> commands (screen / Yahboom robot / UDP / serial)
   robot-test  drive the Yahboom robot from the keyboard (no headset)
   fit         re-fit a profile from a saved calibration recording
@@ -151,7 +151,7 @@ def cmd_run(a):
     engine = CommandEngine(profile)
     sound = Sound(a.sound)
     if src.has_motion:
-        print(f"head-motion gating on (>{profile.motion_thr:.0f} deg/s blocks blink/look commands)")
+        print(f"head-motion gating on (>{profile.motion_thr:.0f} deg/s blocks blink commands)")
     src.flush()
     qual = deque(maxlen=FS)
     last_status = last_hb = time.monotonic()
@@ -293,7 +293,7 @@ def main(argv=None):
 
     s = sub.add_parser("check", help="diagnose the LSL stream (NaN, rate, signal level)")
     _add_source_args(s)
-    s.add_argument("--seconds", type=float, default=20)
+    s.add_argument("--seconds", type=float, default=10)
     s.set_defaults(func=cmd_check)
 
     s = sub.add_parser("calibrate", help="guided calibration -> profile")
@@ -302,7 +302,7 @@ def main(argv=None):
     s.add_argument("--recordings", default="recordings")
     s.add_argument("--trials", type=int, default=8)
     s.add_argument("--rest", type=float, default=15)
-    s.add_argument("--no-sound", action="store_true", help="disable the audio cues")
+    s.add_argument("--no-sound", action="store_true", help="no 'done' chime at the end")
     s.set_defaults(func=cmd_calibrate)
 
     s = sub.add_parser("run", help="live detection -> robot")

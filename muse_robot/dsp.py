@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy import signal
 
-from .config import FS
+from .config import CH, FS
 
 
 class StreamFilter:
@@ -44,47 +44,46 @@ def notch_sos(fs: float, line: float) -> np.ndarray:
 
 @dataclass
 class Features:
-    emg: np.ndarray    # (n,)  jaw-muscle RMS envelope, uV
-    v: np.ndarray      # (n,)  blink signal B: 0.5-10 Hz EEG projected on the learned blink direction, uV
+    emg: np.ndarray    # (n,)  muscle (30-110 Hz) RMS envelope, mean of the 4 channels, uV
+    emg_ear: np.ndarray   # (n,) same, ear sensors TP9/TP10 only (jaw muscles)
+    emg_fore: np.ndarray  # (n,) same, forehead sensors AF7/AF8 only (eyebrow muscle)
+    v: np.ndarray      # (n,)  blink signal B: 0.5-10 Hz EEG projected on the learned blink pattern, uV
     v_up: np.ndarray   # (n,)  B minus its 250 ms trailing minimum (blink height above local baseline)
-    v_down: np.ndarray # (n,)  250 ms trailing maximum minus B
-    hd: np.ndarray     # (n,)  gaze signal H: projected on the learned left-right direction (+ = left), uV
-    h: np.ndarray      # (n,)  same as hd (kept for plotting code)
     eeg: np.ndarray    # (n,4) 1-40 Hz EEG (for plotting / signal quality / future focus-relax)
     bad: np.ndarray    # (n,)  True where the raw sample had NaN/inf (filled with last good value)
-    eye: np.ndarray | None = None  # (n,4) 0.5-10 Hz EEG used for the eye signals (calibration)
+    eye: np.ndarray | None = None  # (n,4) 0.5-10 Hz EEG used for the blink signal (calibration)
     motion: np.ndarray | None = None  # (n,) head-rotation speed (deg/s), zeros if no gyroscope
 
 
-def eye_axes(blink_w, gaze_w) -> tuple[np.ndarray, np.ndarray]:
-    """Unit projection vectors (4 channels) for blink and gaze, each blind to the other.
+SIDEWAYS_EYE = np.array([0.0, 1.0, -1.0, 0.0]) / np.sqrt(2)   # AF7 - AF8: sideways eye movement
 
-    blink_w / gaze_w are the 4-channel patterns learned in calibration. On Muse 2 the
+
+def blink_axis(blink_w) -> np.ndarray:
+    """Unit projection vector (4 channels) for the blink signal.
+
+    blink_w is the 4-channel pattern of a blink learned in calibration. On Muse 2 the
     reference (Fpz) is right above the eyes, so a blink appears mostly as a large
-    negative deflection on TP9/TP10, and left/right eye movement as opposite spikes
-    on AF7/AF8. Removing the shared part means a blink does not move H and a look
-    does not move B.
+    negative deflection on TP9/TP10 and only weakly on AF7/AF8. The sideways-eye
+    direction (AF7 - AF8) is removed, so glancing left/right does not look like a
+    blink (on the real recordings: fewer false double blinks, better cross-session).
     """
-    ub = np.asarray(blink_w, float)
-    ug = np.asarray(gaze_w, float)
-    ub, ug = ub / np.linalg.norm(ub), ug / np.linalg.norm(ug)
-    b_axis = ub - (ub @ ug) * ug
-    g_axis = ug - (ug @ ub) * ub
-    return b_axis / np.linalg.norm(b_axis), g_axis / np.linalg.norm(g_axis)
+    w = np.asarray(blink_w, float)
+    w = w / np.linalg.norm(w)
+    w = w - (w @ SIDEWAYS_EYE) * SIDEWAYS_EYE
+    return w / np.linalg.norm(w)
 
 
 class FeatureExtractor:
-    def __init__(self, fs: float = FS, line_freq: float = 50.0,
-                 blink_w=(-0.9, 0.05, -0.2, -1.0), gaze_w=(0.2, 1.0, -1.0, -0.2)):
+    def __init__(self, fs: float = FS, line_freq: float = 50.0, blink_w=(-0.9, 0.05, -0.2, -1.0)):
         self.fs = fs
-        self.b_axis, self.g_axis = eye_axes(blink_w, gaze_w)
+        self.b_axis = blink_axis(blink_w)
         self.notch = StreamFilter(notch_sos(fs, line_freq))
         self.emg_bp = StreamFilter(signal.butter(4, [30, min(110, fs / 2 - 8)], "bandpass", fs=fs, output="sos"))
         self.eye_bp = StreamFilter(signal.butter(2, [0.5, 10], "bandpass", fs=fs, output="sos"))
         self.eeg_bp = StreamFilter(signal.butter(4, [1, 40], "bandpass", fs=fs, output="sos"))
 
         self.env_n = int(0.10 * fs)                      # 100 ms RMS window
-        self.env_zi = np.zeros(self.env_n - 1)
+        self.env_zi = np.zeros((self.env_n - 1, 4))
         self.base_n = int(0.25 * fs)                     # blink baseline window
         self.v_hist = np.zeros(self.base_n - 1)
         self.last_good = None
@@ -121,21 +120,22 @@ class FeatureExtractor:
         xn = self.notch(x)
 
         emg = self.emg_bp(xn)
-        power = np.mean(emg ** 2, axis=1)
-        power, self.env_zi = signal.lfilter(np.ones(self.env_n) / self.env_n, [1.0], power, zi=self.env_zi)
-        env = np.sqrt(np.maximum(power, 0.0))
+        power, self.env_zi = signal.lfilter(np.ones(self.env_n) / self.env_n, [1.0], emg ** 2, axis=0,
+                                            zi=self.env_zi)       # per-channel 100 ms mean power
+        power = np.maximum(power, 0.0)
+        env = np.sqrt(power.mean(axis=1))
+        env_ear = np.sqrt(power[:, [CH["TP9"], CH["TP10"]]].mean(axis=1))
+        env_fore = np.sqrt(power[:, [CH["AF7"], CH["AF8"]]].mean(axis=1))
 
         eye = self.eye_bp(xn)                            # 0.5-10 Hz, all 4 channels
         v = eye @ self.b_axis                            # blink signal
-        h = eye @ self.g_axis                            # gaze signal (+ = left)
-        hd = h
 
-        # blink height relative to the lowest/highest point of the last 250 ms, so the
+        # blink height relative to the lowest point of the last 250 ms, so the
         # second blink of a quick pair is not shrunk by the filter rebound of the first
         vv = np.concatenate([self.v_hist, v])
         win = np.lib.stride_tricks.sliding_window_view(vv, self.base_n)
         v_up = v - win.min(axis=1)
-        v_down = win.max(axis=1) - v
         self.v_hist = vv[-(self.base_n - 1):]
 
-        return Features(emg=env, v=v, v_up=v_up, v_down=v_down, hd=hd, h=h, eeg=self.eeg_bp(xn), bad=bad, eye=eye)
+        return Features(emg=env, emg_ear=env_ear, emg_fore=env_fore, v=v, v_up=v_up,
+                        eeg=self.eeg_bp(xn), bad=bad, eye=eye)

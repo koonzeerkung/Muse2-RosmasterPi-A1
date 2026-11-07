@@ -1,4 +1,4 @@
-"""Muse 2 -> robot commands: jaw clench, double blink, look left / right."""
+"""Muse 2 -> robot commands: jaw clench and double blink."""
 from .config import DEFAULT_COMMAND_MAP, GESTURES, Profile
 from .detectors import CommandEngine, Event
 
