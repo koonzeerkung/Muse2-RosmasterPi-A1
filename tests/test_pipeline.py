@@ -63,7 +63,7 @@ def test_head_motion_blocks_blink():
 
 
 def test_uncalibrated_profile_never_gives_eyebrow():
-    """Without eyebrow calibration every muscle burst must be STOP (jaw), even a forehead one."""
+    """Without eyebrow calibration every muscle burst is a jaw clench, even a forehead one."""
     from muse_robot.sources import SimulatedSource
     src = SimulatedSource(realtime=False, seed=6, natural_blinks=False)
     eng = CommandEngine(Profile(jaw_thr=15))
@@ -100,7 +100,7 @@ def test_old_recording_with_look_trials_still_fits():
 
 
 def test_stop_survives_dropout_mute():
-    """A jaw clench right after a Bluetooth gap must still give STOP."""
+    """A jaw clench right after a Bluetooth gap must still be reported."""
     from muse_robot.sources import SimulatedSource
     src = SimulatedSource(realtime=False, seed=5, natural_blinks=False)
     eng = CommandEngine(Profile(jaw_thr=20))
@@ -115,20 +115,49 @@ def test_stop_survives_dropout_mute():
     assert any(e.gesture == "JAW_CLENCH" and 103 * 16 / 256 <= e.t <= 104 * 16 / 256 + 0.6 for e in events)
 
 
-def test_robot_bridge_core():
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "robot"))
-    from eeg_cmd_bridge import BridgeCore
-    c = BridgeCore(speed=0.15, steer=0.6, turn_time=1.5, link_timeout=1.5)
-    c.on_command("GO", 0.0)
-    assert c.velocity(0.1) == (0.15, 0.0)
-    c.on_command("LEFT", 0.2)
-    assert c.velocity(0.3) == (0.15, 0.6)
-    c.on_packet(1.0)
-    assert c.velocity(1.8) == (0.15, 0.0)          # turn finished, still driving
-    c.on_command("STOP", 1.9)
-    assert c.velocity(2.0) == (0.0, 0.0)
-    c.on_command("GO", 2.1)
-    assert c.velocity(3.7) == (0.0, 0.0)           # laptop silent > 1.5 s -> watchdog stop
+def test_packets_and_toggles():
+    import json
+    from muse_robot.protocol import PacketBuilder, ToggleState
+    pb = PacketBuilder(ToggleState())
+    hb = pb.heartbeat()
+    assert hb["type"] == "heartbeat" and hb["seq"] == 1 and hb["state"] == {"run": False, "mode": "robot", "music": False}
+    m = pb.event("JAW_CLENCH", 1.0)
+    assert m["event"]["command"] == "TOGGLE_RUN" and m["state"]["run"] is True and m["seq"] == 2
+    m = pb.event("DOUBLE_BLINK", 2.0)
+    assert m["event"]["command"] == "TOGGLE_MODE" and m["state"]["mode"] == "camera"
+    m = pb.event("EYEBROW_RAISE", 3.0)
+    assert m["event"]["command"] == "TOGGLE_MUSIC" and m["state"] == {"run": True, "mode": "camera", "music": True}
+    assert pb.event("UNCLEAR_MUSCLE", 4.0) is None and pb.seq == 4     # never sent
+    json.dumps(m)                                                         # serialisable
+
+
+def test_example_receiver_follows_state_and_link():
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "receiver"))
+    import example_receiver as er
+    from muse_robot.protocol import PacketBuilder, ToggleState
+    calls = []
+    er.on_run = lambda v: calls.append(("run", v))
+    er.on_mode = lambda v: calls.append(("mode", v))
+    er.on_music = lambda v: calls.append(("music", v))
+    rx = er.Receiver()
+    pb = PacketBuilder(ToggleState())
+    rx.handle(pb.heartbeat(), 0.0)
+    rx.handle(pb.event("JAW_CLENCH", 1), 0.5)
+    pb.event("EYEBROW_RAISE", 2)                     # this packet is lost ...
+    rx.handle(pb.heartbeat(), 1.0)                   # ... the next heartbeat still turns music on
+    assert calls == [("run", True), ("music", True)]
+    rx.check_link(3.0)                               # 2 s of silence -> stop
+    assert calls[-1] == ("run", False) and rx.state["run"] is False
+
+
+def test_unclear_muscle_burst_is_not_a_command():
+    from muse_robot.detectors import MuscleDetector
+    d = MuscleDetector(thr=10, min_dur=0.05, refractory=0.5, brow_shift_thr=400, brow_dir=-1, margin=0.25)
+    out = []
+    for i in range(200):                              # burst with a 400 uV forehead shift = on the line
+        t = i / 256
+        out += d.update(t, 50.0, 1.0, 1.0, -400.0 * min(i / 40, 1))
+    assert [e.gesture for e in out] == ["UNCLEAR_MUSCLE"]
 
 
 if __name__ == "__main__":
@@ -141,7 +170,9 @@ if __name__ == "__main__":
     test_eyebrow_vs_jaw_after_calibration()
     test_old_recording_with_look_trials_still_fits()
     test_stop_survives_dropout_mute()
-    test_robot_bridge_core()
+    test_packets_and_toggles()
+    test_example_receiver_follows_state_and_link()
+    test_unclear_muscle_burst_is_not_a_command()
     with tempfile.TemporaryDirectory() as d:
         test_sim_end_to_end(Path(d))
     print("all tests passed")

@@ -294,7 +294,9 @@ def fit_profile(raw, markers, base: Profile | None = None) -> Profile:
     stat = lambda s, e: float(held[s:e].max())                                       # noqa: E731
     muscle = ("JAW_CLENCH", "EYEBROW_RAISE")
     pos = [stat(s, e) for s, e in by("JAW_CLENCH") + by("EYEBROW_RAISE")]
-    neg = [stat(s, e) for s, e in others("JAW_CLENCH", excl=("EYEBROW_RAISE",))]
+    # negatives: rest and blink trials only (eyebrow trials are muscle bursts too; trials of
+    # gestures this version doesn't use, e.g. look in old recordings, must not raise it)
+    neg = [stat(s, e) for l, s, e in keep if l in ("REST", "DOUBLE_BLINK")]
     p.jaw_thr, sep = fit_threshold(pos, neg)
     report["JAW_CLENCH"] = {"thr": round(p.jaw_thr, 2), "separation": round(sep, 2)}
 
@@ -325,10 +327,12 @@ def fit_profile(raw, markers, base: Profile | None = None) -> Profile:
         brow_x = [v[k] for v in brow_s]
         if np.median(brow_x) > np.median(jaw_x):
             cands = np.unique(np.concatenate([jaw_x, brow_x]))
-            # most trials right; ties -> the higher boundary (unclear bursts stay JAW = STOP)
+            # most trials right; ties -> the higher boundary
             score = [np.mean(np.array(brow_x) > c) + np.mean(np.array(jaw_x) <= c) for c in cands]
             c = cands[max(range(len(cands)), key=lambda i: (round(score[i], 6), cands[i]))]
             higher = [v for v in brow_x if v > c]
+            # middle of the gap: eyebrow shifts are much larger than jaw shifts, and a jaw clench
+            # can move the forehead more on another day, so keep the line well above the jaw side
             p.brow_shift_thr = float((c + min(higher)) / 2) if higher else float(c)
             brow_sep = float(np.percentile(brow_x, 10) / max(np.percentile(jaw_x, 90), 1e-6))
     report["EYEBROW_RAISE"] = {"thr": round(p.brow_shift_thr, 1), "separation": round(brow_sep, 2),
@@ -380,7 +384,7 @@ def evaluate(raw, markers, profile: Profile) -> dict:
     events, _ = CommandEngine(profile).process(raw)
     rejected = {(lab, s) for lab, s in profile.report.get("rejected_windows", [])}
     labels = list(GESTURES)
-    confusion = {g: {h: 0 for h in labels + ["none"]} for g in labels}
+    confusion = {g: {h: 0 for h in labels + ["unclear", "none"]} for g in labels}
     slack = int(1.0 * FS)
     rest_s, rest_fp, other_fp = 0.0, 0, 0
     for lab, s, e in _windows(markers):
@@ -391,9 +395,11 @@ def evaluate(raw, markers, profile: Profile) -> dict:
             rest_fp += sum(1 for ev in events if s <= ev.t * FS < e)
             continue
         e = e + slack - int(FIT_SLACK_S * FS)
-        hits = [ev for ev in events if s <= ev.t * FS <= e]
+        early = s - int(0.3 * FS)             # people sometimes start just before the cue
+        hits = [ev for ev in events if early <= ev.t * FS <= e]
         if lab in confusion:
-            confusion[lab][hits[0].gesture if hits else "none"] += 1
+            first = hits[0].gesture if hits else "none"
+            confusion[lab][first if first in confusion[lab] else "unclear"] += 1
         else:
             other_fp += len(hits)
     n_trials = sum(sum(v.values()) for v in confusion.values())
@@ -431,11 +437,16 @@ def print_report(p: Profile, ev: dict) -> None:
         print(f"head-motion threshold: {p.report['motion_thr']} deg/s")
     br = p.report["fit"].get("EYEBROW_RAISE")
     if br and br["thr"] < 1e8:
-        print(f"  eyebrow raise ON: each muscle burst is decided {br['decide_s']} s after it starts "
-              "(STOP comes that much later)")
+        print(f"  eyebrow raise ON: each muscle burst is decided {br['decide_s']} s after it starts; "
+              f"bursts within +-{int(p.brow_margin * 100)}% of the threshold are ignored as unclear")
+        close = [v for v in br["jaw_shift"] + br["brow_shift"]
+                 if p.brow_shift_thr * (1 - p.brow_margin) < v < p.brow_shift_thr * (1 + p.brow_margin)]
+        if close:
+            print(f"  note: {len(close)} calibration trial(s) fell in the unclear zone - clench without moving\n"
+                  "  the eyebrows, and raise the eyebrows higher with the teeth apart")
     if br and br["thr"] >= 1e8:
         print("  warning: eyebrow raise and jaw clench looked the same on your headset, so eyebrow raise\n"
-              "  is OFF (every muscle burst = STOP). Raise the eyebrows higher with the teeth apart,\n"
+              "  is OFF (every muscle burst = jaw clench). Raise the eyebrows higher with the teeth apart,\n"
               "  check the forehead pads sit flat, and redo the eyebrow block.")
     print("\n--- Replay evaluation (accepted trials) ---")
     print(f"accuracy {ev['accuracy'] * 100:.1f}%   per gesture: " +
@@ -445,7 +456,7 @@ def print_report(p: Profile, ev: dict) -> None:
         print("  note: during the rest period you blinked in quick pairs, which looks like a double blink.\n"
               "  Blink normally (relaxed) during rest; if this keeps happening, use a firmer double blink.")
     print("confusion (row = cued, col = detected first):")
-    cols = list(GESTURES) + ["none"]
+    cols = list(GESTURES) + ["unclear", "none"]
     print(" " * 14 + "".join(f"{c[:12]:>13s}" for c in cols))
     for g, row in ev["confusion"].items():
         print(f"{g:14s}" + "".join(f"{row[c]:>13d}" for c in cols))

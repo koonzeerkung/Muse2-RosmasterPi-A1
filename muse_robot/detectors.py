@@ -2,13 +2,14 @@
 
 JAW_CLENCH /  muscle (30-110 Hz) envelope stays above threshold for >= jaw_min_dur;
 EYEBROW_RAISE the burst is an eyebrow raise if the forehead signal moved more than
-              brow_shift_thr within brow_decide_s, otherwise a jaw clench (= STOP)
+              brow_shift_thr within brow_decide_s, clearly less = jaw clench, in between =
+              UNCLEAR_MUSCLE (ignored: not sent to the robot)
 DOUBLE_BLINK  two peaks of the blink signal B above threshold, blink_min_gap..blink_max_gap apart
 
 B comes from dsp.FeatureExtractor (learned 4-channel blink pattern).
 Cross-suppression: muscle bursts and head movement (gyroscope, if streamed) shift
 the electrodes and create slow artifacts, so blink candidates that overlap them
-are discarded. Muscle events (JAW_CLENCH = STOP) are never suppressed or muted.
+are discarded. Muscle events are never suppressed or muted.
 """
 from __future__ import annotations
 
@@ -35,8 +36,9 @@ class MuscleDetector:
     forehead skin under AF7/AF8, which shows as a large slow shift of the forehead signal
     (hundreds of uV within ~0.3 s); clenching the jaw barely moves it. So, when eyebrow
     detection is calibrated, the detector waits until `decide_s` after the burst started
-    and calls it EYEBROW_RAISE only if the forehead moved more than `brow_shift_thr` in the
-    learned direction `brow_dir`; everything else is JAW_CLENCH (= STOP, the safe side).
+    and calls it EYEBROW_RAISE if the forehead moved clearly more than `brow_shift_thr` in
+    the learned direction `brow_dir`, JAW_CLENCH if clearly less, and UNCLEAR_MUSCLE if it is
+    within +-margin of the threshold (the caller ignores it: both gestures are toggles).
     Without eyebrow calibration every burst is JAW_CLENCH, reported right away.
     """
 
@@ -44,10 +46,11 @@ class MuscleDetector:
 
     def __init__(self, thr: float, min_dur: float, refractory: float,
                  brow_shift_thr: float | None = None, brow_dir: int = -1, decide_s: float = 0.3,
-                 fs: float = FS):
+                 margin: float = 0.25, fs: float = FS):
         self.thr, self.min_n, self.refractory = thr, int(min_dur * fs), refractory
         self.brow_on = brow_shift_thr is not None and brow_shift_thr < 1e8
         self.brow_shift_thr, self.brow_dir, self.decide_s = brow_shift_thr, brow_dir, decide_s
+        self.margin = margin
         self.soft = 0.6 * thr
         self.count = 0
         self.ear_sum = self.fore_sum = 0.0
@@ -90,7 +93,12 @@ class MuscleDetector:
             p["exc"] = max(p["exc"], self.brow_dir * (fore_slow - p["base"]))
             if t >= p["at"]:
                 self.pending = None
-                g = "EYEBROW_RAISE" if p["exc"] > self.brow_shift_thr else "JAW_CLENCH"
+                if p["exc"] >= self.brow_shift_thr * (1 + self.margin):
+                    g = "EYEBROW_RAISE"
+                elif p["exc"] <= self.brow_shift_thr * (1 - self.margin):
+                    g = "JAW_CLENCH"
+                else:
+                    g = "UNCLEAR_MUSCLE"
                 out.append(Event(g, t, {"env": p["env"], "ratio": p["ratio"], "shift": round(p["exc"], 1)}))
         if self.count >= self.min_n and not self.fired and t - self.last_fire >= self.refractory:
             self.fired, self.last_fire = True, t
@@ -185,7 +193,7 @@ class CommandEngine:
     NaN handling: NaN samples are replaced by the last good value (in dsp). Short
     gaps are harmless; after a gap >= GAP_S the signal jumps when it comes back,
     which could look like a blink, so blink events are muted for MUTE_S.
-    Muscle events (JAW_CLENCH = STOP, EYEBROW_RAISE) always get through.
+    Muscle events (JAW_CLENCH, EYEBROW_RAISE) always get through.
     """
 
     GAP_S = 0.10
@@ -195,7 +203,8 @@ class CommandEngine:
         self.p, self.fs = profile, fs
         self.fx = FeatureExtractor(fs, profile.line_freq, profile.blink_w)
         self.jaw = MuscleDetector(profile.jaw_thr, profile.jaw_min_dur, profile.jaw_refractory,
-                                  profile.brow_shift_thr, profile.brow_dir, profile.brow_decide_s, fs)
+                                  profile.brow_shift_thr, profile.brow_dir, profile.brow_decide_s,
+                                  profile.brow_margin, fs)
         self.motion = MotionTracker(profile.motion_thr)
         self.blink = BlinkDetector(profile, [self.jaw, self.motion])
         self.n = 0

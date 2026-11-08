@@ -1,9 +1,10 @@
 """Command line entry point:  python -m muse_robot <command> ...
 
   check       stream 10 s and report sample rate, NaN, contact quality per channel
-  calibrate   guided recording (~1.3 min) -> per-user profile JSON
-  run         live detection -> commands (screen / Yahboom robot / UDP / serial)
-  robot-test  drive the Yahboom robot from the keyboard (no headset)
+  calibrate   guided recording (~1.9 min) -> per-user profile JSON
+  run         live detection -> protocol packets (screen / UDP / serial)
+  send-test   send protocol packets from the keyboard (no headset) - test the robot side
+  listen      receive and show protocol packets (stand-in for the robot side)
   fit         re-fit a profile from a saved calibration recording
   sim-test    end-to-end test with the simulated headset (no hardware)
 """
@@ -17,9 +18,10 @@ from collections import deque
 import numpy as np
 
 from .calibrate import QuietUI, calibrate, evaluate, fit_profile, load_recording, print_report
-from .config import CHANNELS, DEFAULT_COMMAND_MAP, FS, GESTURES, Profile
+from .config import CHANNELS, FS, GESTURES, Profile
 from .detectors import CommandEngine
-from .outputs import make_sink
+from .outputs import PrintSink, make_sink
+from .protocol import PacketBuilder, ToggleState
 from .sounds import Sound
 from .sources import LSLSource, SimulatedSource, Source, make_source
 
@@ -41,6 +43,10 @@ class _NoGyro(Source):
 
     def flush(self):
         self.src.flush()
+
+
+HEARTBEAT_S = 0.5        # heartbeat period (protocol)
+LINK_TIMEOUT_S = 1.5     # `listen` reports a lost link after this
 
 
 def _add_source_args(ap):
@@ -148,25 +154,29 @@ def cmd_run(a):
         profile = Profile()
     src = make_source(a.source, fast=a.fast, seed=a.seed, serial_number=a.serial_number)
     sinks = [make_sink(s) for s in (a.output or ["print"])]
+    if not any(isinstance(s, PrintSink) for s in sinks):
+        sinks.insert(0, PrintSink())
     engine = CommandEngine(profile)
+    packets = PacketBuilder(ToggleState(mode=a.start_mode))
     sound = Sound(a.sound)
     if src.has_motion:
         print(f"head-motion gating on (>{profile.motion_thr:.0f} deg/s blocks blink commands)")
+    if profile.brow_shift_thr >= 1e8:
+        print("note: this profile has no eyebrow calibration - every muscle burst counts as a jaw clench")
     src.flush()
     qual = deque(maxlen=FS)
-    last_status = last_hb = time.monotonic()
-    robots = [s for s in sinks if hasattr(s, "heartbeat")]
-    for r in robots:
-        r.heartbeat()
+    last_status = last_hb = 0.0
     demo_next = 3.0
     rng = np.random.default_rng(a.seed)
+    print("start state: " + packets.state.text())
     print("running - Ctrl+C to stop")
     try:
         while True:
-            if robots and time.monotonic() - last_hb >= 0.5:      # keep the robot's watchdog happy
+            if time.monotonic() - last_hb >= HEARTBEAT_S:
                 last_hb = time.monotonic()
-                for r in robots:
-                    r.heartbeat()
+                hb = packets.heartbeat()
+                for s in sinks:
+                    s.send(hb)
             if isinstance(src, SimulatedSource) and src.n / FS >= demo_next:   # demo gestures
                 src.inject(str(rng.choice(GESTURES)))
                 demo_next += 4.0
@@ -176,17 +186,20 @@ def cmd_run(a):
             events, f = engine.process(x)
             qual.extend(f.eeg)
             for ev in events:
+                msg = packets.event(ev.gesture, ev.t, ev.info)
+                if msg is None:                       # e.g. UNCLEAR_MUSCLE: shown, never sent
+                    print(f"\n[{ev.t:8.2f}s] {ev.gesture:13s} ignored (not sure if jaw or eyebrow) {ev.info}")
+                    continue
                 sound.play("event")
-                cmd = DEFAULT_COMMAND_MAP.get(ev.gesture, ev.gesture)
                 for s in sinks:
-                    s.send(ev, cmd)
+                    s.send(msg)
             if time.monotonic() - last_status > 1.0 and len(qual) > 10:
                 last_status = time.monotonic()
                 sd = np.std(np.asarray(qual), axis=0)
                 parts = [f"{n}:{v:5.1f}{'!' if v > 80 or v < 0.5 else ' '}" for n, v in zip(CHANNELS, sd)]
-                robot = "  | " + " ".join(r.status_text() for r in robots) if robots else ""
-                print("\r signal(uV) " + " ".join(parts) + f"  NaN={engine.nan_samples}{robot}    ",
-                      end="", flush=True)
+                links = " ".join(t for t in (s.status_text() for s in sinks) if t)
+                print("\r signal(uV) " + " ".join(parts) + f"  NaN={engine.nan_samples}  | {packets.state.text()}"
+                      + (f" | {links}" if links else "") + "   ", end="", flush=True)
             if a.duration and engine.n / FS >= a.duration:
                 break
     except KeyboardInterrupt:
@@ -198,46 +211,93 @@ def cmd_run(a):
             s.close()
 
 
-def cmd_robot_test(a):
-    """Drive the robot from the keyboard (no headset) to check the Wi-Fi link and the bridge."""
+def cmd_send_test(a):
+    """Send protocol packets from the keyboard (no headset) to test the robot-side receiver."""
     import threading
 
-    from .outputs import UDPSink
-    r = UDPSink(a.ip, a.port)
+    sinks = [PrintSink()] + [make_sink(s) for s in (a.output or [])]
+    packets = PacketBuilder(ToggleState(mode=a.start_mode))
+    lock = threading.Lock()
     stop = threading.Event()
 
     def beat():
         while not stop.is_set():
-            r.heartbeat()
-            time.sleep(0.5)
+            with lock:
+                hb = packets.heartbeat()
+                for s in sinks:
+                    s.send(hb)
+            time.sleep(HEARTBEAT_S)
 
     threading.Thread(target=beat, daemon=True).start()
-    print(f"Robot test -> {a.ip}:{a.port}   (the robot must be running robot/start_bridge.sh)")
-    time.sleep(1.0)
-    print("  " + ("CONNECTED - " + r.status_text() if r.connected() else
-                  "NO REPLY from the robot yet: check the IP, same Wi-Fi, and that the bridge is running"))
-    keys = {"g": "GO", "w": "GO", "s": "STOP", " ": "STOP", "x": "STOP", "a": "LEFT", "l": "LEFT",
-            "d": "RIGHT", "r": "RIGHT"}
-    print("  type a key + Enter:  g=GO  s=STOP  a=LEFT  d=RIGHT  q=quit   (STOP is sent on quit)")
+    keys = {"j": "JAW_CLENCH", "b": "DOUBLE_BLINK", "e": "EYEBROW_RAISE"}
+    print("Send test - heartbeats every 0.5 s to: " + (", ".join(a.output) if a.output else "screen only"))
+    print("start state: " + packets.state.text())
+    print("  type a key + Enter:  j = jaw clench (TOGGLE_RUN)   b = double blink (TOGGLE_MODE)\n"
+          "                       e = eyebrow raise (TOGGLE_MUSIC)   q = quit")
+    t0 = time.monotonic()
     try:
         while True:
-            k = input("  > ").strip().lower()
-            if k in ("q", "quit", "exit"):
+            k = input("  > ").strip().lower()[:1]
+            if k == "q":
                 break
-            cmd = keys.get(k[:1] if k else " ", k.upper())
-            if cmd not in ("GO", "STOP", "LEFT", "RIGHT"):
-                print("  ?  use g / s / a / d / q")
+            if k not in keys:
+                print("  ?  use j / b / e / q")
                 continue
-            r.send(None, cmd)
-            time.sleep(0.25)
-            r.poll()
-            print("   ", r.status_text())
+            with lock:
+                msg = packets.event(keys[k], time.monotonic() - t0, {"test": True})
+                for s in sinks:
+                    s.send(msg)
     except (KeyboardInterrupt, EOFError):
         pass
     finally:
         stop.set()
-        r.close()
-        print("  sent STOP, bye")
+        for s in sinks:
+            s.close()
+
+
+def cmd_listen(a):
+    """Receive and show protocol packets (a stand-in for the robot side, for testing)."""
+    import json
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", a.port))
+    sock.settimeout(0.5)
+    print(f"listening on UDP port {a.port} (Ctrl+C to stop)")
+    last, last_seq = None, None
+    try:
+        while True:
+            try:
+                data, addr = sock.recvfrom(4096)
+            except socket.timeout:
+                if last is not None and time.monotonic() - last > LINK_TIMEOUT_S:
+                    print(f"  !! no message for {LINK_TIMEOUT_S} s - link lost (the robot side should stop)")
+                    last = None
+                continue
+            now = time.monotonic()
+            if last is None:
+                print(f"  link from {addr[0]}")
+            last = now
+            try:
+                msg = json.loads(data.decode())
+            except ValueError:
+                print(f"  not JSON: {data[:80]!r}")
+                continue
+            seq = msg.get("seq")
+            if last_seq is not None and seq is not None and seq != last_seq + 1:
+                print(f"  (packets lost or reordered: #{last_seq} -> #{seq})")
+            last_seq = seq
+            st = msg.get("state", {})
+            if msg.get("type") == "event":
+                e = msg["event"]
+                print(f"  #{seq:<5} {e['gesture']:13s} -> {e['command']:12s} state: run={st.get('run')} "
+                      f"mode={st.get('mode')} music={st.get('music')}")
+            elif a.verbose:
+                print(f"  #{seq:<5} heartbeat     state: run={st.get('run')} mode={st.get('mode')} music={st.get('music')}")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sock.close()
 
 
 def cmd_sim_test(a):
@@ -305,19 +365,26 @@ def main(argv=None):
     s.add_argument("--no-sound", action="store_true", help="no 'done' chime at the end")
     s.set_defaults(func=cmd_calibrate)
 
-    s = sub.add_parser("run", help="live detection -> robot")
+    s = sub.add_parser("run", help="live detection -> protocol packets")
     _add_source_args(s)
     s.add_argument("--profile", default="profiles/default.json")
     s.add_argument("--output", action="append",
-                   help="print | robot:IP[:PORT] | udp:HOST:PORT | serial:PORT[:BAUD]  (repeatable)")
+                   help="print | udp:HOST:PORT | serial:PORT[:BAUD]  (repeatable; screen is always on)")
+    s.add_argument("--start-mode", default="robot", choices=["robot", "camera"],
+                   help="mode before the first double blink")
     s.add_argument("--duration", type=float, default=0, help="stop after N seconds (0 = forever)")
     s.add_argument("--sound", action="store_true", help="short beep whenever a command is detected")
     s.set_defaults(func=cmd_run)
 
-    s = sub.add_parser("robot-test", help="drive the Yahboom robot from the keyboard (check the link)")
-    s.add_argument("ip", help="robot IP address")
+    s = sub.add_parser("send-test", help="send protocol packets from the keyboard (no headset)")
+    s.add_argument("--output", action="append", help="udp:HOST:PORT | serial:PORT[:BAUD] (repeatable)")
+    s.add_argument("--start-mode", default="robot", choices=["robot", "camera"])
+    s.set_defaults(func=cmd_send_test)
+
+    s = sub.add_parser("listen", help="receive and show protocol packets (test receiver)")
     s.add_argument("--port", type=int, default=9000)
-    s.set_defaults(func=cmd_robot_test)
+    s.add_argument("--verbose", action="store_true", help="also show heartbeats")
+    s.set_defaults(func=cmd_listen)
 
     s = sub.add_parser("fit", help="re-fit profile from a saved recording")
     s.add_argument("recording")

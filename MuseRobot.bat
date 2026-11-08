@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
-title Muse 2 Robot Control
+title Muse 2 EEG - robot packets
 cd /d "%~dp0"
 
 rem ============================================================
@@ -60,19 +60,21 @@ rem ============================================================
 cls
 echo.
 echo  ==============================================
-echo     Muse 2  -^>  RosmasterPi A1 Robot Control
+echo     Muse 2  -^>  robot packets
 echo  ==============================================
 echo     Start BlueMuse and press "Start Streaming" first.
 echo     Current profile: %NAME%
 echo.
+echo     Jaw clench = TOGGLE_RUN   Double blink = TOGGLE_MODE   Eyebrow raise = TOGGLE_MUSIC
+echo.
 echo     1. Check signal   ^(NaN, contact quality, 10 s^)
 echo     2. Calibrate      ^(about 2 minutes^)
 echo     3. Run            - show commands on screen only
-echo     4. Run            - send to a SERIAL device ^(COM port^)
-echo     5. Run            - drive the YAHBOOM ROBOT over Wi-Fi
-echo     6. Change profile name
-echo     7. Test without headset ^(simulator^)
-echo     8. Test robot connection ^(keyboard, no headset^)
+echo     4. Run            - send packets to the robot side ^(UDP^)
+echo     5. Change profile name
+echo     6. Test without headset ^(simulator^)
+echo     7. Send test packets ^(keyboard, no headset^)
+echo     8. Listen for packets ^(test receiver^)
 echo     0. Exit
 echo.
 echo     While running: press Ctrl+C, then N, to come back here.
@@ -82,11 +84,11 @@ set /p "CH=  Choose 0-8: "
 if "%CH%"=="1" goto :check
 if "%CH%"=="2" goto :calibrate
 if "%CH%"=="3" goto :run_print
-if "%CH%"=="4" goto :run_serial
-if "%CH%"=="5" goto :run_robot
-if "%CH%"=="6" goto :profile
-if "%CH%"=="7" goto :simtest
-if "%CH%"=="8" goto :robot_test
+if "%CH%"=="4" goto :run_udp
+if "%CH%"=="5" goto :profile
+if "%CH%"=="6" goto :simtest
+if "%CH%"=="7" goto :send_test
+if "%CH%"=="8" goto :listen
 if "%CH%"=="0" exit /b 0
 goto :menu
 
@@ -106,27 +108,21 @@ call :need_profile
 "%VPY%" -m muse_robot run --profile "profiles\%NAME%.json" --output print --sound
 goto :done
 
-:run_serial
+:run_udp
 call :need_profile
-set "PORT=COM5"
-if exist "profiles\last_port.txt" set /p PORT=<"profiles\last_port.txt"
-set /p "PORT=  COM port [%PORT%]: "
-set "BAUD=115200"
-set /p "BAUD=  Baud rate [%BAUD%]: "
-> "profiles\last_port.txt" echo %PORT%
-"%VPY%" -m muse_robot run --profile "profiles\%NAME%.json" --output print --output serial:%PORT%:%BAUD% --sound
+call :ask_target
+"%VPY%" -m muse_robot run --profile "profiles\%NAME%.json" --output udp:%TARGET_IP%:%TARGET_PORT% --sound
 goto :done
 
-:run_robot
-call :need_profile
-call :ask_robot
-echo  Start robot/start_bridge.sh on the robot first. Jaw clench = STOP.
-"%VPY%" -m muse_robot run --profile "profiles\%NAME%.json" --output print --output robot:%ROBOT_IP%:9000 --sound
+:send_test
+call :ask_target
+"%VPY%" -m muse_robot send-test --output udp:%TARGET_IP%:%TARGET_PORT%
 goto :done
 
-:robot_test
-call :ask_robot
-"%VPY%" -m muse_robot robot-test %ROBOT_IP%
+:listen
+set "LPORT=9000"
+set /p "LPORT=  UDP port to listen on [9000]: "
+"%VPY%" -m muse_robot listen --port %LPORT%
 goto :done
 
 :profile
@@ -143,7 +139,7 @@ pause
 goto :menu
 
 rem ============================================================
-rem  helpers (called with "call :name", they return with exit /b)
+rem  helpers - each is used with CALL and returns with exit /b
 rem ============================================================
 :ask_profile
 set /p "NAME=  Profile name, e.g. your nickname [%NAME%]: "
@@ -151,11 +147,13 @@ set "NAME=%NAME: =_%"
 > "profiles\last.txt" echo %NAME%
 exit /b 0
 
-:ask_robot
-set "ROBOT_IP=192.168.1.11"
-if exist "profiles\last_robot_ip.txt" set /p ROBOT_IP=<"profiles\last_robot_ip.txt"
-set /p "ROBOT_IP=  Robot IP address [%ROBOT_IP%]: "
-> "profiles\last_robot_ip.txt" echo %ROBOT_IP%
+:ask_target
+set "TARGET_IP=127.0.0.1"
+if exist "profiles\last_target_ip.txt" set /p TARGET_IP=<"profiles\last_target_ip.txt"
+set /p "TARGET_IP=  IP address of the robot-side computer [%TARGET_IP%]: "
+> "profiles\last_target_ip.txt" echo %TARGET_IP%
+set "TARGET_PORT=9000"
+set /p "TARGET_PORT=  UDP port [9000]: "
 exit /b 0
 
 :need_profile
